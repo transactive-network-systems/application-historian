@@ -1,0 +1,65 @@
+[build-system]
+requires = ["poetry-core>=1.2.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "volttron-transactive-node-historian"
+version = "3.0.0"
+description = "A VOLTTRON historian agent for storing Transactive Node System (TNS) data records with dynamic table registration"
+authors = ["VOLTTRON Team <volttron@pnnl.gov>"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/eclipse-volttron/volttron-transactive-node-historian"
+homepage = "https://github.com/eclipse-volttron/volttron-transactive-node-historian"
+keywords = ["volttron", "agent", "historian", "transactive", "TNS", "data-storage"]
+packages = [
+    { include = "historian", from = "src" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"  # Compatible with both old and new VOLTTRON
+# Support both old and new VOLTTRON
+volttron = { version = ">=8.0", optional = true }
+volttron-core = { version = ">=0.1.0", optional = true }
+volttron-lib-base-historian = { version = ">=2.0.0rc1", allow-prereleases = true }
+sqlalchemy = ">=1.4.0,<3.0"
+pytz = ">=2021.1"
+# tent will be provided by volttron dependency
+
+[tool.poetry.extras]
+legacy = ["volttron"]
+modular = ["volttron-core"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0.0"
+pytest-timeout = ">=2.0.0"
+mock = ">=4.0.0"
+pre-commit = ">=2.0.0"
+
+[tool.poetry.scripts]
+volttron-transactive-node-historian = "historian.transactivate_node.transactive_node:main"
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.black]
+line-length = 120
+target-version = ['py310']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"

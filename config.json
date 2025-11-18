@@ -1,0 +1,9 @@
+{
+    "connection": {
+        "type": "sqlite",
+        "params": {
+            "url": "sqlite:///historian_data.sqlite"
+        }
+    },
+    "all_platforms": true
+}
