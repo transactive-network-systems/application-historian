@@ -1,0 +1,23 @@
+[workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "win-64"]
+
+[dependencies]
+python = "3.10.*"
+pytest = "*"
+poetry = "*"
+
+[pypi-dependencies]
+volttron-core = { path = "../../volttron-core", editable = true }
+tent = { path = "../../TENT", editable = true }
+volttron-transactive-node-historian = { path = ".", editable = true }
+
+[tasks]
+# Start VOLTTRON platform using setup script
+volttron-start = "bash setup.sh"
+
+# Build wheel
+build = "poetry build"
+
+# Test
+test = "pytest -v"

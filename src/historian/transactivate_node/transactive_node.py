@@ -45,7 +45,7 @@ def historian(config_path, **kwargs):
     config = load_config(config_path) or {
         "connection": {
             "type": "sqlite",
-            "params": {"url": "sqlite:////home/volttron/historian_data.sqlite"}
+            "params": {"url": "sqlite:///historian_data.sqlite"}
         },
         "topic_replace_list": [],
         "custom_topics": {"capture_record_data": ["TNS/"]}  # Correct format
@@ -271,12 +271,8 @@ class TNSHistorian2(BaseHistorian):
                                     data['timestamp'] = dt
                                 except ValueError as e:
                                     _log.error(f"Timestamp parse error: {data['timestamp']} - {e}")
-                            # Ensure the table exists before storing
-                            table_columns = [
-                                {"name": k, "type": "String" if isinstance(v, str) else "DateTime" if k == "timestamp" else "JSON"}
-                                for k, v in data.items()
-                            ]
-                            self._ensure_table_exists(table_name, table_columns)
+                            # Table schema was already created via register_table RPC call
+                            # Don't re-infer schema from data as it won't have primary key info
                             records_to_store.append({'table_name': table_name, 'data': data})
                         else:
                             _log.info(f"Table {table_name} not tracked, storing in unknown_table_records")
