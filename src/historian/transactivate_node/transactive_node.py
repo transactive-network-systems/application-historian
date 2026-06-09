@@ -10,9 +10,6 @@ __version__ = "3.0.0"
 
 import logging
 import json
-import os
-import sqlite3
-from sqlalchemy.orm import Session
 
 from importlib.metadata import distribution, PackageNotFoundError
 from tent.data_manager.local_data_manager import LocalDataManager
@@ -65,100 +62,48 @@ class TNSHistorian2(BaseHistorian):
 
     def __init__(self, connection, **kwargs):
         _log.info("TNSHistorian2 initialization started")
-        # Save connection info before calling parent constructor.
-        self.connection = connection
+        self.connection = connection or {}
         # Track which tables are automatically stored.
         self.tracked_tables = set()
         self.unknown_table_initialized = False
 
-        # Ensure SQLite connection parameters include a URL if using SQLite.
-        if self.connection.get("type", "").lower() == "sqlite":
-            db_params = self.connection.get("params", {})
-            # NOTE: The URL in the config is preferred. If the directory for the database cannot be created,
-            # or if the URL is missing, a fallback path in the agent's working directory will be used instead.
-            # This ensures the historian always has a writable database location, but may confuse users
-            # if the config URL is not respected due to directory issues.
-            if "url" in db_params and db_params["url"].startswith("sqlite:///"):
-                db_path = db_params["url"].replace("sqlite:///", "")
-                if db_path.startswith("/"):
-                    db_dir = os.path.dirname(db_path)
-                    if not os.path.exists(db_dir):
-                        try:
-                            _log.info(f"Creating directory for database: {db_dir}")
-                            os.makedirs(db_dir, exist_ok=True)
-                        except Exception as e:
-                            _log.warning(f"Cannot create directory: {e}")
-                            agent_data_dir = self._get_agent_data_dir()
-                            new_db_path = os.path.join(agent_data_dir, "historian_data.sqlite")
-                            _log.info(f"Using fallback database path: {new_db_path}")
-                            db_params["url"] = f"sqlite:///{new_db_path}"
-            if "url" not in db_params:
-                agent_data_dir = self._get_agent_data_dir()
-                db_path = os.path.join(agent_data_dir, "historian_data.sqlite")
-                db_params["url"] = f"sqlite:///{db_path}"
-            self.connection["params"] = db_params
-            _log.info(f"Using SQLite connection parameters: {db_params}")
-
         # Initialize BaseHistorian – it handles subscriptions and caching.
         super(TNSHistorian2, self).__init__(**kwargs)
 
-        # Initialize the TENTS data manager after BaseHistorian is set up.
-        # We pass schema "tns" to LocalDataManager.
-        try:
-            self.data_manager = LocalDataManager(
-                None,  # transactive_node
-                self.connection["params"],
-                100
-            )
-            _log.info("Successfully created TENTS data manager")
-        except Exception as e:
-            _log.error(f"Failed to create TENTS data manager: {e}")
-            self.data_manager = None
+        self.data_manager = self._create_data_manager()
 
-    def _get_agent_data_dir(self):
-        """
-        Get (and create if necessary) the agent's data directory.
-        """
-        current_dir = os.getcwd()
-        agent_name = os.path.basename(current_dir)
-        agent_data_dir = os.path.join(current_dir, f"{agent_name}.agent-data")
-        if not os.path.exists(agent_data_dir):
-            try:
-                os.makedirs(agent_data_dir, exist_ok=True)
-            except Exception as e:
-                _log.warning(f"Cannot create agent data directory: {e}")
-                agent_data_dir = current_dir
-        return agent_data_dir
+    def _create_data_manager(self):
+        """Create the TENT-owned local archive from historian connection settings."""
+        try:
+            data_manager = LocalDataManager(self, self.connection.get("params"), 100)
+            _log.info("Successfully created TENT data manager")
+            return data_manager
+        except Exception as e:
+            _log.error(f"Failed to create TENT data manager: {e}")
+            return None
 
     def historian_setup(self):
         """Called at startup and after configuration changes."""
         _log.info("Setting up TNSHistorian2")
         if self.data_manager is None:
-            try:
-                self.data_manager = LocalDataManager(
-                    None,
-                    self.connection["params"],
-                    100
-                )
-            except Exception as e:
-                _log.error(f"Failed to initialize TENTS data manager: {e}")
+            self.data_manager = self._create_data_manager()
+            if self.data_manager is None:
                 return
         try:
             self.data_manager.init_archive()
-            _log.info("Successfully initialized TENTS data manager")
+            _log.info("Successfully initialized TENT data manager")
         except Exception as e:
-            _log.error(f"Failed to initialize TENTS data manager: {e}")
+            _log.error(f"Failed to initialize TENT data manager: {e}")
 
     def _ensure_table_exists(self, table_name, table_columns):
         """
-        Ensure the table exists in the TENTS data manager.
+        Ensure the table exists in the TENT data manager.
         """
         _log.debug(f"Ensuring table {table_name} exists")
-        if not hasattr(self.data_manager, 'orm') or table_name not in self.data_manager.orm:
+        if not self.data_manager.has_table(table_name):
             _log.info(f"Creating table {table_name}")
             table_def = {"name": table_name, "columns": table_columns}
-            self.data_manager.add_tables([table_def])
-            self.data_manager.init_archive()
+            self.data_manager.register_tables([table_def])
         else:
             _log.debug(f"Table {table_name} already exists")
 
@@ -177,10 +122,7 @@ class TNSHistorian2(BaseHistorian):
                 {"name": "timestamp", "type": "DateTime"}
             ]
         }
-        self.data_manager.add_tables([unknown_table_def])
-        self.data_manager.init_archive()
-        # Explicitly create the table in the database
-        self.data_manager.registry.metadata.create_all(self.data_manager.engine, checkfirst=True)
+        self.data_manager.register_tables([unknown_table_def])
         self.unknown_table_initialized = True
 
     @RPC.export
@@ -192,17 +134,9 @@ class TNSHistorian2(BaseHistorian):
         if not table_name or not isinstance(table_columns, list):
             return {"status": "error", "message": "Invalid table name or columns"}
         if self.data_manager is None:
-            try:
-                _log.info(f"Initializing data manager with params: {self.connection['params']}")
-                self.data_manager = LocalDataManager(
-                    None,
-                    self.connection["params"],
-                    100
-                )
-                self.data_manager.init_archive()
-            except Exception as e:
-                _log.error(f"Failed to initialize data manager: {e}")
-                return {"status": "error", "message": f"Data manager init failed: {str(e)}"}
+            self.data_manager = self._create_data_manager()
+            if self.data_manager is None:
+                return {"status": "error", "message": "Data manager initialization failed"}
         try:
             self._ensure_table_exists(table_name, table_columns)
             self.tracked_tables.add(table_name)
@@ -215,23 +149,37 @@ class TNSHistorian2(BaseHistorian):
     @RPC.export
     def create_tables(self, message):
         try:
-            # Parse the message.
-            if isinstance(message, str):
-                payload = json.loads(message)
+            payload = json.loads(message) if isinstance(message, str) else message
+            if isinstance(payload, list):
+                definitions = payload
+            elif isinstance(payload, dict) and "definitions" in payload:
+                definitions = payload["definitions"]
+                definitions = json.loads(definitions) if isinstance(definitions, str) else definitions
+            elif isinstance(payload, dict):
+                # VolttronDataManager sends its definitions mapping directly.
+                definitions = list(payload.values())
             else:
-                payload = message
-            definitions_str = payload.get("definitions", "[]")
-            # schema_from_msg = payload.get("schema")  # Schema-related processing commented out
-            # if schema_from_msg:
-            #     self.schema = schema_from_msg
-            definitions = json.loads(definitions_str)
+                raise ValueError("Table definitions must be a list or mapping")
+
+            if not isinstance(definitions, list):
+                raise ValueError("Table definitions must resolve to a list")
         except Exception as e:
             _log.error("Failed to parse create_tables message: %s", e)
             return {"status": "error", "message": "Failed to parse message"}
-        # _log.info("Creating tables with schema: %s", self.schema)  # Schema-related logging commented out
-        self.data_manager.add_tables(definitions)
-        self.data_manager.registry.metadata.create_all(self.data_manager.engine, checkfirst=True)
-        _log.info("Tables have been created and committed to the database.")
+
+        if self.data_manager is None:
+            self.data_manager = self._create_data_manager()
+            if self.data_manager is None:
+                return {"status": "error", "message": "Data manager initialization failed"}
+
+        try:
+            self.data_manager.register_tables(definitions)
+            self.tracked_tables.update(definition["name"] for definition in definitions)
+        except Exception as e:
+            _log.error("Failed to register tables with the TENT data manager: %s", e, exc_info=True)
+            return {"status": "error", "message": f"Failed to register tables: {e}"}
+
+        _log.info("Tables have been registered with the TENT data manager.")
         return {"status": "success", "message": "Tables created successfully."}
 
     def publish_to_historian(self, to_publish_list):

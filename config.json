@@ -5,5 +5,10 @@
             "url": "sqlite:///historian_data.sqlite"
         }
     },
+    "custom_topics": {
+        "capture_record_data": [
+            "TNS/"
+        ]
+    },
     "all_platforms": true
 }
