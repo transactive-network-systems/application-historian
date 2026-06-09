@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "volttron-transactive-node-historian"
 version = "3.0.0"
-description = "A VOLTTRON historian agent for storing Transactive Node System (TNS) data records with dynamic table registration"
+description = "A modular VOLTTRON historian backed by TENT LocalDataManager"
 authors = ["VOLTTRON Team <volttron@pnnl.gov>"]
 license = "Apache-2.0"
 readme = "README.md"
@@ -28,18 +28,10 @@ classifiers = [
 ]
 
 [tool.poetry.dependencies]
-python = "^3.10"  # Compatible with both old and new VOLTTRON
-# Support both old and new VOLTTRON
-volttron = { version = ">=8.0", optional = true }
-volttron-core = { version = ">=0.1.0", optional = true }
+python = "^3.10"
+volttron-core = ">=0.1.0"
 volttron-lib-base-historian = { version = ">=2.0.0rc1", allow-prereleases = true }
-sqlalchemy = ">=1.4.0,<3.0"
-pytz = ">=2021.1"
-# tent will be provided by volttron dependency
-
-[tool.poetry.extras]
-legacy = ["volttron"]
-modular = ["volttron-core"]
+# Install the local TENT package with `vctl install-lib` before this agent.
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0.0"

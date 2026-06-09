@@ -14,14 +14,10 @@ CUSTOMIZATION REQUIRED:
 -----------------------
 To use this script for your own system, modify the following:
 
-1. HISTORIAN AGENT IDENTITY (Line ~72):
-   Update "volttron-transactive-node-historian-3.0.0_1" to match your installed historian.
-   Find it by running: pixi run vctl status
-
-2. TABLE NAME (Line ~35, optional):
+1. TABLE NAME (Line ~35, optional):
    Change test_table_name = "test_transactive_records" to your desired table name.
 
-3. TABLE SCHEMA (Lines ~59-66):
+2. TABLE SCHEMA (Lines ~59-66):
    Modify the table_columns list to match your data structure:
    - Keep the "id" column with primary_key for SQLAlchemy requirements
    - Add/remove/modify other columns as needed
@@ -30,10 +26,10 @@ To use this script for your own system, modify the following:
 4. TEST DATA (Lines ~91-97):
    Update the "data" dictionary to match your schema and desired test values.
 
-5. TOPIC (Line ~87, optional):
+4. TOPIC (Line ~87, optional):
    Change topic = f"TNS/{test_table_name}" if your historian subscribes to a different pattern.
 
-6. AGENT IDENTITY (Line ~47, optional):
+5. AGENT IDENTITY (Line ~47, optional):
    Change "test.injector" if you want a different identity name.
 
 USAGE:
@@ -96,30 +92,33 @@ def main():
         
         # First, register the table with the historian via RPC
         print(f"\nRegistering table '{test_table_name}' with historian...")
-        table_columns = [
-            {"name": "id", "type": "Integer", "kwargs": {"primary_key": True, "autoincrement": True}},
-            {"name": "device_name", "type": "String"},
-            {"name": "power", "type": "Float"},
-            {"name": "price", "type": "Float"},
-            {"name": "timestamp", "type": "DateTime"},
-            {"name": "notes", "type": "String"}
-        ]
+        table_definition = {
+            "name": test_table_name,
+            "columns": [
+                {"name": "id", "type": "Integer", "kwargs": {"primary_key": True, "autoincrement": True}},
+                {"name": "device_name", "type": "String"},
+                {"name": "power", "type": "Float"},
+                {"name": "price", "type": "Float"},
+                {"name": "timestamp", "type": "DateTime"},
+                {"name": "notes", "type": "String"}
+            ]
+        }
         
         try:
             result = agent.vip.rpc.call(
-                "volttron-transactive-node-historian-3.0.0_1",
-                "register_table",
-                test_table_name,
-                table_columns
+                "tns.historian",
+                "create_tables",
+                [table_definition]
             ).get(timeout=5)
             print(f"[OK] Registration result: {result}")
         except Exception as e:
             print(f"[WARNING] Could not register table: {e}")
-            print("Data will go to unknown_table_records...")
+            print("Records will remain retryable until the table is registered.")
         
         # Publish test records
         print(f"\nPublishing test records to TNS/{test_table_name}...")
         topic = f"TNS/{test_table_name}"
+        standard_topic = f"record/{test_table_name}"
         
         now = format_timestamp(datetime.utcnow())
         headers = {
@@ -151,6 +150,21 @@ def main():
             ).get(timeout=5)
             
             print(f"  [OK] Record {i} published")
+
+            standard_value = 1000.0 + (i * 10.0)
+            standard_now = format_timestamp(datetime.utcnow())
+            standard_headers = dict(headers)
+            standard_headers[headers_mod.DATE] = standard_now
+            standard_headers[headers_mod.TIMESTAMP] = standard_now
+            standard_headers["units"] = "kW"
+            agent.vip.pubsub.publish(
+                "pubsub",
+                standard_topic,
+                headers=standard_headers,
+                message=standard_value,
+            ).get(timeout=5)
+
+            print(f"  [OK] Standard VOLTTRON record {i} published")
             gevent.sleep(0.5)
         
         print("\n" + "=" * 60)

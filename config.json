@@ -10,5 +10,10 @@
             "TNS/"
         ]
     },
+    "tables_def": {
+        "data_table": "data",
+        "topics_table": "topics"
+    },
+    "table_definitions": [],
     "all_platforms": true
 }
