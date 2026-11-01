@@ -19,5 +19,7 @@
         "topics_table": "topics"
     },
     "table_definitions": [],
-    "enumerations": []
+    "enumerations": [],
+    "bind_publishers": false,
+    "publisher_bindings": {}
 }

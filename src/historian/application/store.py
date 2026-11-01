@@ -16,6 +16,8 @@ Database side of the Application Historian, kept free of VOLTTRON so it can be e
   fingerprint at the same version is a warning naming the application), one of another version is refused with both
   versions in the error, leaving the other applications untouched. An application whose tables are already in the
   database without its row is version 1 (before the schema was versioned) and refused the same way; nothing is migrated;
+- `publisher_senders`: the learned publisher bindings (publisher, sender, first_seen) when the agent runs with
+  `bind_publishers` on: the first sender to use a publisher name is recorded and later senders are refused;
 - the archive tables themselves, created from the definitions.
 
 On start-up (`setup`) the stored enumerations and definitions are reloaded, any table in the database that has no stored
@@ -43,6 +45,7 @@ _log = logging.getLogger(__name__)
 
 KNOWN_TABLE_DEFINITIONS = 'known_table_definitions'
 KNOWN_ENUMERATIONS = 'known_enumerations'
+PUBLISHER_SENDERS = 'publisher_senders'
 
 
 def format_timestamp(value: datetime) -> str:
@@ -111,9 +114,11 @@ class HistorianStore:
         self.topics_table: str = table_names['topics_table']
         self.data_table: str = table_names['data_table']
         self.own_tables: set[str] = {self.topics_table, self.data_table, KNOWN_TABLE_DEFINITIONS, KNOWN_ENUMERATIONS,
+                                     PUBLISHER_SENDERS,
                                      ARCHIVE_SCHEMA_TABLE}
         self.data_manager: LocalDataManager | None = None
         self.reflected_tables: set[str] = set()
+        self.bound_senders: dict[str, str] = {}  # learned publisher bindings, loaded from publisher_senders
         self.topic_id_map: dict[str, int] = {}
         self.topic_name_map: dict[str, str] = {}
         self.topic_meta: dict[int, dict] = {}
@@ -237,6 +242,14 @@ class HistorianStore:
                     {'name': 'registered_time', 'type': 'DateTime', 'kwargs': {'nullable': False}},
                 ],
             },
+            {
+                'name': PUBLISHER_SENDERS,
+                'columns': [
+                    {'name': 'publisher', 'type': 'String', 'type_args': [255], 'kwargs': {'primary_key': True}},
+                    {'name': 'sender', 'type': 'String', 'type_args': [255], 'kwargs': {'nullable': False}},
+                    {'name': 'first_seen', 'type': 'DateTime', 'kwargs': {'nullable': False}},
+                ],
+            },
         ]
 
     def _build_data_manager(self) -> None:
@@ -264,6 +277,20 @@ class HistorianStore:
         data_manager.init_archive()  # creates tables for the reloaded definitions when missing
         self.data_manager = data_manager
         self.reflected_tables = set(reflected)
+        self.bound_senders = {row['publisher']: row['sender'] for row in data_manager.query_data(PUBLISHER_SENDERS)}
+
+    # ---------------------------------------------------------------- publisher bindings (learned)
+    def bound_sender(self, publisher: str) -> str | None:
+        return self.bound_senders.get(publisher)
+
+    def bind_publisher(self, publisher: str, sender: str) -> None:
+        """Record the first sender seen for a publisher; kept for the life of the database."""
+        with self._lock:
+            self._require_ready()
+            self.data_manager.upsert_data(PUBLISHER_SENDERS, {
+                'publisher': publisher, 'sender': sender, 'first_seen': datetime.now(timezone.utc),
+            }, ['publisher'])
+            self.bound_senders[publisher] = sender
 
     @staticmethod
     def _stored_definitions(data_manager: LocalDataManager) -> dict[str, dict]:

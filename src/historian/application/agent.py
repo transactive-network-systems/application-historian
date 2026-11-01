@@ -23,6 +23,12 @@ is a standard record, except that an archive envelope is recognised by shape whe
 handling is in `HistorianStore` (store.py); this module is the VOLTTRON shell: configuration from the config store,
 RPC exports, the pubsub registration path and the BaseHistorian publishing contract.
 
+Publisher bindings (optional, `bind_publishers`): with the check on, each `<publisher>` segment is bound to one sender
+identity, configured in advance (`publisher_bindings`) or learned from the first sender; records, definitions messages
+and RPC registrations from another sender are dropped and counted (bindings.py). The sender of a captured publication
+is the identity the platform presents to the capture callback; it is stamped into the record's headers there
+(`SENDER_HEADER`) because the processing loop only sees the cached record.
+
 Identity: VOLTTRON historians are conventionally installed as `platform.historian` (`DEFAULT_VIP_IDENTITY`); the
 modular platform assigns the identity at `vctl install --vip-identity`, so a deployment may choose another, as long as
 every publisher addresses the same one.
@@ -42,6 +48,7 @@ from volttron.client.messaging import headers as headers_mod
 from volttron.client.vip.agent import RPC
 from volttron.utils import load_config, vip_main
 
+from historian.application.bindings import PublisherBindings, parse_bindings_configuration
 from historian.application.definitions import check_enumerations, parse_definitions
 from historian.application.store import HistorianStore, RegistrationResult
 
@@ -54,6 +61,7 @@ DEFAULT_VIP_IDENTITY = PLATFORM_HISTORIAN
 
 ARCHIVE_SEGMENT = "archive"
 RECORDS_TOPIC, DEFINITIONS_TOPIC, STATUS_TOPIC = "records", "definitions", "status"
+SENDER_HEADER = "ApplicationHistorian-Sender"  # set by the capture callback from the platform's sender; never trusted from a publisher
 
 CONFIGURATION_HELP = ('Store the historian configuration as the config-store entry "config" of the historian\'s VIP '
                       'identity, e.g. vctl config store <identity> config <config file>. It must contain '
@@ -85,7 +93,8 @@ def historian(config_path, **kwargs):
 class ApplicationHistorian(BaseHistorian):
     """Store standard VOLTTRON records and registered application archive records in one SQLAlchemy database."""
 
-    def __init__(self, connection=None, tables_def=None, table_definitions=None, enumerations=None, **kwargs):
+    def __init__(self, connection=None, tables_def=None, table_definitions=None, enumerations=None,
+                 bind_publishers=False, publisher_bindings=None, **kwargs):
         # The RPC handlers (create_tables, queries) run on the agent's greenlets; the publishing loop must as well so
         # that the data manager is never touched from a second OS thread.
         if not kwargs.pop("process_loop_in_greenlet", True):
@@ -96,6 +105,7 @@ class ApplicationHistorian(BaseHistorian):
         self.tables_def, self.table_names = self.parse_table_def(tables_def)
         self.configured_table_definitions = parse_definitions(table_definitions)
         self.configured_enumerations = check_enumerations(enumerations)
+        self.bindings = PublisherBindings(*parse_bindings_configuration(bind_publishers, publisher_bindings))
         self.store: HistorianStore | None = None
         super().__init__(process_loop_in_greenlet=True, **kwargs)
         self.update_default_config({
@@ -103,6 +113,8 @@ class ApplicationHistorian(BaseHistorian):
             "tables_def": tables_def,
             "table_definitions": self.configured_table_definitions,
             "enumerations": self.configured_enumerations,
+            "bind_publishers": bind_publishers,
+            "publisher_bindings": publisher_bindings or {},
         })
 
     # ---------------------------------------------------------------- BaseHistorian contract
@@ -117,6 +129,8 @@ class ApplicationHistorian(BaseHistorian):
         self.tables_def, self.table_names = self.parse_table_def(configuration.get("tables_def"))
         self.configured_table_definitions = parse_definitions(configuration.get("table_definitions"))
         self.configured_enumerations = check_enumerations(configuration.get("enumerations"))
+        self.bindings = PublisherBindings(*parse_bindings_configuration(configuration.get("bind_publishers", False),
+                                                                        configuration.get("publisher_bindings")))
         self.store = HistorianStore(connection, self.table_names)  # raises ValueError for a URL that is not SQLAlchemy's
         self.connection = connection
         _log.info(f"Historian database: {self.store.redacted_url}")
@@ -129,15 +143,25 @@ class ApplicationHistorian(BaseHistorian):
             raise RuntimeError(f'The historian is not configured (see the configuration error logged above). '
                                f'{CONFIGURATION_HELP}')
         self.store.setup(self.configured_table_definitions, self.configured_enumerations)
+        self.bindings.attach(self.store, self.store.bound_senders)
         _log.info(f"Historian ready; archive tables: {sorted(self.store.writable_tables)}; applications: "
-                  f"{self.store.schema_versions()}")
+                  f"{self.store.schema_versions()}; publisher bindings {'on' if self.bindings.enabled else 'off'}")
+
+    def _capture_record_data(self, peer, sender, bus, topic, headers, message):
+        """Stamp the sender the platform presents into the headers before the base historian caches the record, so
+        the processing loop can check publisher bindings. A value a publisher set under this key is overwritten."""
+        headers = dict(headers or {})
+        headers[SENDER_HEADER] = sender
+        super()._capture_record_data(peer, sender, bus, topic, headers, message)
 
     def publish_to_historian(self, to_publish_list):
         """
         Persist one BaseHistorian batch. Topics under `<prefix>/archive/<publisher>/` are handled by kind: `records` carry
         envelopes, `definitions` carry a registration request (answered on `status`), `status` is the historian's own
-        reply coming back through its capture and is ignored. Everything else is written as it comes. Every record is
-        reported handled: rows that cannot be stored are logged, not retried.
+        reply coming back through its capture and is ignored. With publisher bindings on, records and definitions
+        from a sender that is not the publisher's are dropped first (a definitions message gets an error status).
+        Everything else is written as it comes. Every record is reported handled: rows that cannot be stored are
+        logged, not retried.
         """
         if self.store is None or not self.store.ready:
             raise RuntimeError(f'The historian database is not open; {len(to_publish_list)} record(s) stay cached. '
@@ -149,16 +173,23 @@ class ApplicationHistorian(BaseHistorian):
                 to_write.append(record)
                 continue
             prefix, publisher, kind = parsed
+            if kind == STATUS_TOPIC:  # the historian's own publication
+                _log.debug(f'Ignoring the historian\'s own status publication on {record["topic"]!r}')
+                continue
+            sender = (record.get("headers") or {}).get(SENDER_HEADER)
+            decision = self.bindings.check(publisher, sender)
+            if not decision.allowed:
+                if kind == DEFINITIONS_TOPIC:
+                    self._refuse_definitions_message(prefix, publisher, record.get("value"), decision.message)
+                continue
             if kind == RECORDS_TOPIC:
                 if HistorianStore.is_envelope_payload(record.get("value")):
                     to_write.append(record)
                 else:
                     _log.error(f'Dropped a message on {record["topic"]!r} that is not an archive envelope or a list '
                                f'of them: {str(record.get("value"))[:200]!r}')
-            elif kind == DEFINITIONS_TOPIC:
+            else:  # DEFINITIONS_TOPIC
                 self._handle_definitions_message(prefix, publisher, record.get("value"))
-            else:  # STATUS_TOPIC: the historian's own publication
-                _log.debug(f'Ignoring the historian\'s own status publication on {record["topic"]!r}')
         if to_write:
             result = self.store.write(to_write)
             if result.dropped:
@@ -204,6 +235,13 @@ class ApplicationHistorian(BaseHistorian):
         if request_id is not None:
             self._publish_status(prefix, publisher, request_id, reply)
 
+    def _refuse_definitions_message(self, prefix, publisher, message, reason):
+        """Answer a definitions message whose sender is not the publisher's with an error status (when it can be
+        answered); the warning itself was logged by the bindings."""
+        request_id = message.get("request_id") if isinstance(message, Mapping) else None
+        if isinstance(request_id, str) and request_id:
+            self._publish_status(prefix, publisher, request_id, self._error_reply(reason))
+
     def _publish_status(self, prefix, publisher, request_id, reply):
         topic = f"{prefix}/{ARCHIVE_SEGMENT}/{publisher}/{STATUS_TOPIC}"
         now = datetime.now(timezone.utc).isoformat()
@@ -240,13 +278,32 @@ class ApplicationHistorian(BaseHistorian):
         holds for it}; "success" means every table is registered (created now or already known and identical),
         "partial" that at least one was and at least one was rejected, "error" that none was.
 
+        With publisher bindings on, a payload may carry `"publisher"`: the caller's identity is then checked against
+        (or bound as) that publisher's sender and a mismatch is refused with "error". Without the key the registration
+        is accepted with a warning; only the records published later are bound.
+
         This RPC runs DDL; the modular platform has no `RPC.allow` decorator, so protect it per deployment:
         `vctl authz add agent <historian identity> --protected-rpcs create_tables` and give each publisher
         `--rpc-capabilities <historian identity>.create_tables`.
         """
         if self.store is None or not self.store.ready:
             return self._error_reply(f"The historian database is not open. {CONFIGURATION_HELP}")
+        if self.bindings.enabled:
+            publisher = definitions.get("publisher") if isinstance(definitions, Mapping) else None
+            caller = self._rpc_caller()
+            if not isinstance(publisher, str) or not publisher:
+                _log.warning(f'create_tables from {caller!r} names no "publisher"; with publisher bindings on the '
+                             f'registration is not bound to a publisher, only the records it publishes later are.')
+            else:
+                decision = self.bindings.check(publisher, caller)
+                if not decision.allowed:
+                    return self._error_reply(decision.message)
         return self._register(definitions)
+
+    def _rpc_caller(self):
+        """The authenticated identity of the current RPC caller, as the platform's own authorization check reads it."""
+        user = self.vip.rpc.context.vip_message.user
+        return user.decode("utf-8") if isinstance(user, bytes) else str(user)
 
     def _register(self, payload):
         try:

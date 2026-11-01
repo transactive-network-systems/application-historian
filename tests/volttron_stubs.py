@@ -26,10 +26,19 @@ class _PubSub:
         return _Result()
 
 
+class _Rpc:
+    """Exposes the calling identity the way the platform does: vip.rpc.context.vip_message.user."""
+
+    def __init__(self):
+        self.context = types.SimpleNamespace(vip_message=types.SimpleNamespace(user="caller.identity",
+                                                                              peer="caller.identity"))
+
+
 class _Vip:
 
     def __init__(self):
         self.pubsub = _PubSub()
+        self.rpc = _Rpc()
 
 
 class BaseHistorian:
@@ -40,6 +49,10 @@ class BaseHistorian:
         self.handled_all = 0
         self.handled_records = []
         self.vip = _Vip()
+        self.captured = []  # what _capture_record_data queued: (topic, headers, message)
+
+    def _capture_record_data(self, peer, sender, bus, topic, headers, message):
+        self.captured.append((topic, headers, message))
 
     def update_default_config(self, config):
         self._default_config.update(config)

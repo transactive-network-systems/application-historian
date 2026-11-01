@@ -29,7 +29,8 @@ refused (the archive convention is UTC-aware everywhere).
 
 Package `historian.application` (`src/historian/application/`): `agent.py` holds the agent class
 `ApplicationHistorian` and the entry point `main`; `store.py` holds `HistorianStore` (database handling, free of
-VOLTTRON); `definitions.py` holds definition parsing, allow-list validation, canonical form and diff. The distribution
+VOLTTRON); `definitions.py` holds definition parsing, allow-list validation, canonical form and diff; `bindings.py` holds the
+optional publisher bindings (which sender may speak for a publisher segment). The distribution
 is `volttron-application-historian`; its console script is `volttron-application-historian`.
 
 ## Table registration
@@ -135,10 +136,50 @@ vctl authz add agent <publisher identity> --rpc-capabilities <historian>.create_
 
 Without these rules any authenticated peer can register tables (within the allow-list above).
 
-The pubsub path has no equivalent: any agent on any federated platform can publish definitions and records under any
-publisher segment, and there is no per-publisher capability as with protected RPCs. Until sender identity is checked
-(planned work, deferred), the allow-list validation above is the only guard on that path, and the records path accepts
-envelopes from any publisher on either path.
+The pubsub path has no equivalent capability: any agent on any federated platform can publish definitions and records
+under any publisher segment. Publisher bindings (next section) close this per publisher name: with `bind_publishers`
+on, a publisher segment accepts one sender only. With bindings off the allow-list validation above is the only guard
+on that path, and the records path accepts envelopes from any publisher. With bindings on, the bare-identity
+limitation across platforms remains until the router qualifies identities.
+
+### Publisher bindings (optional)
+
+By default the historian stores whatever is published under the prefixes it watches, like every VOLTTRON historian:
+any agent may use any `<publisher>` segment. With `"bind_publishers": true` each publisher name is bound to one
+*sender*, the identity the platform presents for the publication (the RPC caller's identity on the RPC path):
+
+```json
+"bind_publishers": true,
+"publisher_bindings": {
+  "PNNL_Campus": {"sender": "tn.campus@campus"},
+  "CoR":         {"sender": "tn.city@city"}
+}
+```
+
+- A **listed** publisher is pinned to the configured sender.
+- An **unlisted** publisher is bound to the first sender that uses its name, for the life of the database; the binding
+  is kept in the `publisher_senders` table (`publisher`, `sender`, `first_seen`) and reloaded at start-up. A configured
+  binding wins over a learned one that disagrees (logged at start-up). Bindings learned while the check was on stay in
+  the table and are ignored while it is off.
+- The check runs before anything is processed: records and definitions messages on `<prefix>/archive/<publisher>/...`
+  from another sender are dropped and counted, and a definitions message with a `request_id` is answered with
+  `{"status": "error", "message": "Sender '...' may not register or archive for publisher '...'; that publisher is
+  bound to sender '...'."}`. A `create_tables` call checks the caller against the payload's `"publisher"` key when it
+  carries one; without the key the registration is accepted with a warning and only the records published later are
+  bound. A message that carries no sender identity is refused while bindings are on.
+- Mismatches are logged at WARNING with a count, one line per minute per publisher and sender
+  (`Sender 'tn.x' may not register or archive for publisher 'P'; that publisher is bound to sender 'tn.y'. Dropped
+  (N message(s) since the last warning); M dropped for this publisher since start.`); nothing stops and no platform
+  alert is published.
+
+Senders are written `identity@instance`. The platform presents bare identities today (`tn.campus`, not
+`tn.campus@campus`), so a bare presented identity matches a qualified binding by its identity part, a bare learned
+binding matches a later qualified identity the same way, and the historian logs once which form it sees. Until the
+router qualifies identities, a binding therefore does not distinguish the same identity installed on two platforms of
+a federation; when it does, nothing in the configuration changes and the bare form stops matching. The sender of a
+captured publication is what the platform hands the capture callback, stamped into the record's headers under
+`ApplicationHistorian-Sender` (any value a publisher sets under that header is overwritten); it is available for topics
+captured through `custom_topics.capture_record_data`, which is how archive prefixes are configured.
 
 ## Configuration
 
@@ -211,8 +252,8 @@ Requirements: Python 3.11 or later, `volttron-core >= 2.0.0rc0`, `volttron-lib-b
   returns an empty list: the historian has no aggregate tables and does not compute aggregates.
 - **Topic patterns are globs.** `get_topics_by_pattern` matches a case-insensitive shell-style pattern (`*`, `?`,
   `[seq]`), not a regular expression as the SQL historians do.
-- **Trusted senders.** Envelopes are accepted from any publisher on payload shape alone; sender checks are a planned
-  change.
+- **Trusted senders by default.** With `bind_publishers` off (the default) envelopes are accepted from any publisher
+  on payload shape alone; see "Publisher bindings".
 
 ## Development
 
