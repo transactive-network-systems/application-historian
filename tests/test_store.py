@@ -7,18 +7,21 @@ import pytest
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 
-from conftest import SAMPLE_DEFINITIONS, TABLE_NAMES, envelope_record, standard_record
-from historian.application.store import KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
-from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
-from tent.enumerations import MarketTypes
+from archivable import ARCHIVE_SCHEMA_TABLE, ArchiveSchemaMismatch
+
+from conftest import (APPLICATION, FINGERPRINT, SAMPLE_DEFINITIONS, SAMPLE_ENUMERATIONS, SCHEMA_VERSION, TABLE_NAMES,
+                      envelope_record, registration, standard_record)
+from historian.application.store import KNOWN_ENUMERATIONS, KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
 
 MARKET_ID = "0190a3c0-0000-7000-8000-000000000001"
 INTERVAL_ID = "0190a3c0-0000-7000-8000-000000000002"
 
 
-def open_store(connection, definitions=()):
+def open_store(connection, definitions=(), enumerations=SAMPLE_ENUMERATIONS):
+    """A store with the sample enumeration registered at set-up (as a configured enumeration), so definitions naming
+    it can be registered directly with register_definitions."""
     store = HistorianStore(connection, TABLE_NAMES)
-    store.setup(definitions)
+    store.setup(definitions, enumerations)
     return store
 
 
@@ -72,57 +75,140 @@ class TestValidateConnection:
 def test_setup_creates_the_historians_own_tables(connection, db_url):
     open_store(connection)
     present = set(inspect(create_engine(db_url)).get_table_names())
-    assert {"topics", "data", KNOWN_TABLE_DEFINITIONS, ARCHIVE_SCHEMA_TABLE} <= present
+    assert {"topics", "data", KNOWN_TABLE_DEFINITIONS, KNOWN_ENUMERATIONS, ARCHIVE_SCHEMA_TABLE} <= present
 
 
-# ---------------------------------------------------------------- archive schema version
-def test_new_database_records_the_archive_schema_version(connection, db_url):
+# ---------------------------------------------------------------- archive schema versions, per application
+def test_setup_records_no_schema_and_a_registration_records_its_applications(connection, db_url):
     store = open_store(connection)
-    assert store.schema_version == ARCHIVE_SCHEMA_VERSION
+    assert store.schema_versions() == {} and store.data_manager.hosts_applications
+    result = store.register(registration())
+    assert result.status == "success" and (result.application, result.schema_version) == (APPLICATION, SCHEMA_VERSION)
     [row] = store.data_manager.query_data(ARCHIVE_SCHEMA_TABLE)
-    assert row["version"] == ARCHIVE_SCHEMA_VERSION and row["fingerprint"] and row["tent_version"]
-    open_store(connection, SAMPLE_DEFINITIONS)  # restart, same version: accepted, still one row
-    assert len(open_store(connection).data_manager.query_data(ARCHIVE_SCHEMA_TABLE)) == 1
+    assert (row["application"], row["version"], row["fingerprint"], row["application_version"]) == \
+        (APPLICATION, SCHEMA_VERSION, FINGERPRINT, "1.2.3")
+    assert store.register(registration()).status == "success"  # the same application again: still one row
+    assert store.schema_versions() == {APPLICATION: SCHEMA_VERSION}
+    restarted = open_store(connection)  # a restart keeps the record and the tables
+    assert restarted.schema_versions() == {APPLICATION: SCHEMA_VERSION}
+    assert restarted.registered_tables == {"component", "market", "time_interval"}
 
 
-def test_database_of_another_schema_version_is_refused_at_setup(connection, db_url):
-    open_store(connection, SAMPLE_DEFINITIONS)
-    with create_engine(db_url).begin() as conn:
-        conn.execute(text(f"UPDATE {ARCHIVE_SCHEMA_TABLE} SET version = {ARCHIVE_SCHEMA_VERSION + 5}"))
-    with pytest.raises(ArchiveSchemaMismatch) as error:
-        open_store(connection)
-    message = str(error.value)
-    assert f"version {ARCHIVE_SCHEMA_VERSION + 5}" in message and f"version {ARCHIVE_SCHEMA_VERSION}" in message
-    assert "Historian database" in message and "Recreate the database" in message
-    assert error.value.database_version == ARCHIVE_SCHEMA_VERSION + 5
-
-
-def test_database_without_the_archive_schema_table_is_version_one_and_refused(connection, db_url):
-    """A historian database from before 2 November 2026 has the historian's tables but no archive_schema."""
-    open_store(connection, SAMPLE_DEFINITIONS)
-    with create_engine(db_url).begin() as conn:
-        conn.execute(text(f"DROP TABLE {ARCHIVE_SCHEMA_TABLE}"))
-    with pytest.raises(ArchiveSchemaMismatch, match=f"version 1;.*version {ARCHIVE_SCHEMA_VERSION}"):
-        open_store(connection)
-
-
-def test_archive_schema_is_a_reserved_table(connection):
+def test_several_applications_each_have_their_row_and_their_version(connection):
     store = open_store(connection)
-    result = store.register_definitions([{"name": ARCHIVE_SCHEMA_TABLE,
-                                          "columns": [{"name": "version", "type": "Integer",
-                                                       "kwargs": {"primary_key": True}}]}])
-    assert result.status == "error" and "reserved" in result.rejected[ARCHIVE_SCHEMA_TABLE]["message"]
+    store.register(registration())
+    other = registration(definitions=[{"name": "other_thing", "columns": [{"name": "id", "type": "Integer",
+                                                                         "kwargs": {"primary_key": True}}]}],
+                         enumerations=None, application="Other", schema_version=7, fingerprint="o" * 64)
+    result = store.register(other)
+    assert result.status == "success" and result.application == "Other" and result.schema_version == 7
+    assert store.schema_versions() == {"Other": 7, APPLICATION: SCHEMA_VERSION}
+    assert store.registered_tables == {"component", "market", "time_interval", "other_thing"}
 
 
-def test_publisher_schema_version_problem_names_both_versions():
-    assert HistorianStore.publisher_schema_version_problem(ARCHIVE_SCHEMA_VERSION) is None
-    problem = HistorianStore.publisher_schema_version_problem(ARCHIVE_SCHEMA_VERSION + 1)
-    assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in problem and f"version {ARCHIVE_SCHEMA_VERSION}" in problem
-    assert "Nothing was registered" in problem
-    missing = HistorianStore.publisher_schema_version_problem(None)
-    assert "does not state" in missing and "version 1" in missing and f"version {ARCHIVE_SCHEMA_VERSION}" in missing
-    assert HistorianStore.publisher_schema_version_problem(str(ARCHIVE_SCHEMA_VERSION)) is not None
-    assert HistorianStore.publisher_schema_version_problem(True) is not None
+def test_another_version_of_a_known_application_is_refused_and_the_rest_untouched(connection):
+    store = open_store(connection)
+    store.register(registration())
+    result = store.register(registration(schema_version=SCHEMA_VERSION + 5))
+    assert result.status == "error" and result.registered == [] and result.rejected == {}
+    assert f"version {SCHEMA_VERSION}" in result.message and f"version {SCHEMA_VERSION + 5}" in result.message
+    assert f"(application {APPLICATION!r})" in result.message and "Recreate the database" in result.message
+    assert (result.application, result.schema_version) == (APPLICATION, SCHEMA_VERSION), "the recorded version"
+    assert store.schema_versions() == {APPLICATION: SCHEMA_VERSION}
+    assert store.registered_tables == {"component", "market", "time_interval"}
+
+
+def test_same_version_with_another_fingerprint_is_a_warning_naming_the_application(connection, caplog):
+    store = open_store(connection)
+    store.register(registration())
+    with caplog.at_level(logging.WARNING, logger="archivable.schema"):
+        result = store.register(registration(fingerprint="e" * 64))
+    assert result.status == "success"
+    assert f"(application {APPLICATION!r})" in caplog.text and "without a version bump" in caplog.text
+
+
+def test_tables_of_an_application_without_its_record_are_version_one_and_refused(connection, db_url):
+    """A historian database from before the archive schema was versioned has the application's tables but no row."""
+    store = open_store(connection)
+    store.register(registration())
+    with create_engine(db_url).begin() as conn:
+        conn.execute(text(f"DELETE FROM {ARCHIVE_SCHEMA_TABLE}"))
+    restarted = open_store(connection)
+    assert restarted.registered_tables == {"component", "market", "time_interval"} and restarted.schema_versions() == {}
+    result = restarted.register(registration())
+    assert result.status == "error" and result.schema_version == 1
+    assert f"version 1; {APPLICATION} writes archive schema version {SCHEMA_VERSION}" in result.message
+    assert restarted.schema_versions() == {}, "nothing was recorded for it"
+    other = registration(definitions=[{"name": "fresh", "columns": [{"name": "id", "type": "Integer",
+                                                                    "kwargs": {"primary_key": True}}]}],
+                         enumerations=None, application="Fresh", schema_version=2, fingerprint="f" * 64)
+    assert restarted.register(other).status == "success", "an application whose tables are all new is not affected"
+
+
+def test_a_registration_without_its_schema_is_refused(connection):
+    store = open_store(connection)
+    for payload in (SAMPLE_DEFINITIONS, {d["name"]: d for d in SAMPLE_DEFINITIONS}, {"definitions": SAMPLE_DEFINITIONS}):
+        result = store.register(payload)
+        assert result.status == "error" and result.registered == [] and result.rejected == {}
+        assert "states no application, schema_version, fingerprint" in result.message
+    result = store.register(registration(schema_version=str(SCHEMA_VERSION)))
+    assert result.status == "error" and "not an integer" in result.message
+    result = store.register(registration(fingerprint=None))
+    assert result.status == "error" and "states no fingerprint" in result.message
+    result = store.register("not json")
+    assert result.status == "error"
+    assert store.registered_tables == set() and store.schema_versions() == {}
+
+
+def test_archive_schema_and_known_enumerations_are_reserved_tables(connection):
+    store = open_store(connection)
+    for name in (ARCHIVE_SCHEMA_TABLE, KNOWN_ENUMERATIONS):
+        result = store.register_definitions([{"name": name, "columns": [{"name": "version", "type": "Integer",
+                                                                          "kwargs": {"primary_key": True}}]}])
+        assert result.status == "error" and "reserved" in result.rejected[name]["message"]
+
+
+# ---------------------------------------------------------------- enumerations
+def test_enumerations_in_the_registration_are_registered_persisted_and_reloaded(connection, db_url):
+    store = open_store(connection, enumerations=())
+    assert store.registered_enumerations == {}
+    result = store.register(registration())
+    assert result.status == "success"
+    assert store.registered_enumerations == {"MarketTypes": ["auction", "consensus", "matching"]}
+    with create_engine(db_url).connect() as conn:
+        rows = conn.execute(text(f"SELECT name, members FROM {KNOWN_ENUMERATIONS}")).all()
+    assert rows == [("MarketTypes", '["auction", "consensus", "matching"]')]
+    store.write([envelope_record(market_envelopes())])
+    restarted = open_store(connection, enumerations=())  # the stored enumeration is reloaded before the definitions
+    assert restarted.registered_enumerations == {"MarketTypes": ["auction", "consensus", "matching"]}
+    assert restarted.data_manager.query_data("market")[0]["market_type"].name == "auction"
+    assert restarted.write([envelope_record([dict(market_envelopes()[0], data=dict(
+        market_envelopes()[0]["data"], id="0190a3c0-0000-7000-8000-000000000003", market_type="matching"))])]).archive_rows == 1
+
+
+def test_a_table_naming_an_enumeration_the_registration_does_not_carry_is_rejected(connection):
+    store = open_store(connection, enumerations=())
+    result = store.register(registration(enumerations=None))
+    assert result.status == "partial" and result.registered == ["component"], "component names no enumeration"
+    assert "names enumeration 'MarketTypes', which is neither in this registration's enumerations nor already " \
+           "registered" in result.rejected["market"]["message"]
+    assert "'market', which was rejected" in result.rejected["time_interval"]["message"]
+    assert store.registered_enumerations == {} and store.registered_tables == {"component"}
+    result = store.register(registration())  # the same tables with their enumeration
+    assert result.status == "success"
+    result = store.register(registration(enumerations=None))  # once registered, the enumeration need not travel again
+    assert result.status == "success"
+
+
+def test_malformed_or_conflicting_enumerations_refuse_the_registration(connection):
+    store = open_store(connection, enumerations=())
+    result = store.register(registration(enumerations=[{"name": "MarketTypes", "members": []}]))
+    assert result.status == "error" and "Enumerations rejected" in result.message and "non-empty" in result.message
+    assert store.registered_tables == set() and store.registered_enumerations == {}
+    store.register(registration())
+    result = store.register(registration(enumerations=[{"name": "MarketTypes", "members": ["auction", "other"]}]))
+    assert result.status == "error" and "already registered with members" in result.message
+    assert store.registered_enumerations == {"MarketTypes": ["auction", "consensus", "matching"]}
 
 
 def test_register_persists_definitions_and_creates_tables(connection, db_url):
@@ -265,6 +351,13 @@ def test_configured_definitions_are_registered_at_setup(connection):
         open_store(connection, bad)
 
 
+def test_configured_definitions_need_their_enumerations_configured_too(connection):
+    with pytest.raises(ValueError, match="names enumeration 'MarketTypes'"):
+        open_store(connection, SAMPLE_DEFINITIONS, enumerations=())
+    with pytest.raises(ValueError, match="non-empty list"):
+        open_store(connection, enumerations=[{"name": "MarketTypes", "members": []}])
+
+
 # ---------------------------------------------------------------- restart
 def test_restart_reloads_definitions_and_accepts_envelopes_without_re_registration(connection, caplog):
     first = open_store(connection)
@@ -324,7 +417,7 @@ def test_envelopes_with_json_string_values_are_normalised_by_column_type(connect
 
     market = store.data_manager.query_data("market")[0]
     assert market["id"] == uuid.UUID(MARKET_ID)
-    assert market["market_type"] is MarketTypes.auction
+    assert market["market_type"].name == "auction", "decoded through the enumeration received over the wire"
     assert market["delivery_start_time"] == datetime(2026, 6, 9, 13, tzinfo=timezone.utc)
     assert market["active"] is True
     component = store.data_manager.query_data("component")[0]  # joined inheritance wrote the parent row
@@ -363,7 +456,7 @@ def test_row_the_data_manager_quarantines_does_not_block_the_rest_of_the_batch(c
     bad = {"table_name": "time_interval", "data": dict(bad["data"], start_time="2026-06-09T13:00:00")}  # naive
     with caplog.at_level(logging.ERROR):
         result = store.write([envelope_record([bad, good])])
-    assert result.archive_rows == 2 and result.dropped == 0  # both handed over; TENT quarantined one of them
+    assert result.archive_rows == 2 and result.dropped == 0  # both handed over; the data manager quarantined one
     assert len(store.data_manager.query_data("market")) == 1
     assert store.data_manager.query_data("time_interval") == []
     assert any("Quarantined" in r.message and "timezone-aware" in r.message for r in caplog.records)

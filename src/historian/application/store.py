@@ -1,23 +1,27 @@
 """
 Database side of the Application Historian, kept free of VOLTTRON so it can be exercised against a SQLite file.
 
-`HistorianStore` owns one TENT `LocalDataManager` (SQLAlchemy) and in it:
+`HistorianStore` owns one lib-archivable `LocalDataManager` (SQLAlchemy), declared a host of many applications
+(`declare_multi_application`), and in it:
 
 - the standard historian tables (`topics`, `data`) for ordinary VOLTTRON records;
-- `known_table_definitions`: one row per registered archive table (name, canonical definition JSON, time registered).
-  Definitions arrive from each publisher's registration (RPC or pubsub); persisting them beside the data is what lets
-  the historian restart without the publishers re-registering, and is what the mismatch check compares against;
-- `archive_schema`: TENT's one-row record of the archive schema version the database was written with
-  (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`), written by the data manager when the database is new and checked on
-  every start-up: a database of another version is refused (`ArchiveSchemaMismatch`, both versions in the message),
-  nothing is migrated. A publisher's registration states its own schema version and is refused when it differs from the
-  historian's TENT (`publisher_schema_version_problem`);
-- the archive tables themselves, created from those definitions.
+- `known_table_definitions`: one row per registered archive table (name, canonical definition JSON, time registered),
+  and `known_enumerations`: one row per registered enumeration (name, member names JSON, time registered).
+  Definitions and enumerations arrive in each publisher's registration (`create_tables` RPC or the definitions topic);
+  persisting them beside the data is what lets the historian restart without the publishers re-registering, and is
+  what the mismatch check compares against;
+- `archive_schema`: the library's record of the archive schema each application writes, one row per application
+  (`application`, `version`, `fingerprint`, `application_version`, `created`). A registration states its application's
+  schema; the first registration of an application writes its row, a later one of the same version is accepted (another
+  fingerprint at the same version is a warning naming the application), one of another version is refused with both
+  versions in the error, leaving the other applications untouched. An application whose tables are already in the
+  database without its row is version 1 (before the schema was versioned) and refused the same way; nothing is migrated;
+- the archive tables themselves, created from the definitions.
 
-On start-up (`setup`) the stored definitions are reloaded, any table in the database that has no stored definition is
-reflected and accepted for writes with a logged warning (its column semantics are then whatever reflection recovers:
-on SQLite an `Interval` reflects as DATETIME, an `Enum` as VARCHAR, a `Uuid` as CHAR(32)), and the tables are created
-if missing. Registering a definition for a reflected table replaces the reflected table with the definition.
+On start-up (`setup`) the stored enumerations and definitions are reloaded, any table in the database that has no stored
+definition is reflected and accepted for writes with a logged warning (its column semantics are then whatever reflection
+recovers: on SQLite an `Interval` reflects as DATETIME, an `Enum` as VARCHAR, a `Uuid` as CHAR(32)), and the tables are
+created if missing. Registering a definition for a reflected table replaces the reflected table with the definition.
 """
 import json
 import logging
@@ -28,17 +32,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
 
+from archivable import ARCHIVE_SCHEMA_TABLE, UNVERSIONED, ArchiveSchema, ArchiveSchemaMismatch, LocalDataManager
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
-from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
-from tent.data_manager.local_data_manager import LocalDataManager
 
-from historian.application.definitions import (canonical_json, check_definitions, describe_difference,
-                                                      reject_unresolved)
+from historian.application.definitions import (canonical_json, check_definitions, check_enumerations,
+                                               describe_difference, parse_registration, reject_unresolved)
 
 _log = logging.getLogger(__name__)
 
 KNOWN_TABLE_DEFINITIONS = 'known_table_definitions'
+KNOWN_ENUMERATIONS = 'known_enumerations'
 
 
 def format_timestamp(value: datetime) -> str:
@@ -52,13 +56,22 @@ def format_timestamp(value: datetime) -> str:
 
 @dataclass
 class RegistrationResult:
-    """Outcome of one registration call; the agent turns it into the create_tables reply / status message."""
+    """Outcome of one registration; the agent turns it into the create_tables reply / status message."""
     registered: list[str] = field(default_factory=list)  # accepted tables: created now or already known and identical
     created: list[str] = field(default_factory=list)  # the subset that was new in this call
     rejected: dict[str, dict] = field(default_factory=dict)  # table -> {"message": str, "differences": str | None}
+    application: str | None = None       # the application the registration was for, once it stated one
+    schema_version: int | None = None    # the archive schema version the historian holds for that application
+    refusal: str | None = None           # set when the registration was refused whole, before any table was looked at
+
+    @classmethod
+    def refused(cls, message: str, application: str | None = None, schema_version: int | None = None):
+        return cls(application=application, schema_version=schema_version, refusal=message)
 
     @property
     def status(self) -> str:
+        if self.refusal is not None:
+            return 'error'
         if self.registered and not self.rejected:
             return 'success'
         if self.registered:
@@ -67,6 +80,8 @@ class RegistrationResult:
 
     @property
     def message(self) -> str:
+        if self.refusal is not None:
+            return self.refusal
         parts = []
         if self.created:
             parts.append(f'{len(self.created)} table(s) created: {sorted(self.created)}')
@@ -95,7 +110,8 @@ class HistorianStore:
         self.url: str = self.validate_connection(connection)
         self.topics_table: str = table_names['topics_table']
         self.data_table: str = table_names['data_table']
-        self.own_tables: set[str] = {self.topics_table, self.data_table, KNOWN_TABLE_DEFINITIONS, ARCHIVE_SCHEMA_TABLE}
+        self.own_tables: set[str] = {self.topics_table, self.data_table, KNOWN_TABLE_DEFINITIONS, KNOWN_ENUMERATIONS,
+                                     ARCHIVE_SCHEMA_TABLE}
         self.data_manager: LocalDataManager | None = None
         self.reflected_tables: set[str] = set()
         self.topic_id_map: dict[str, int] = {}
@@ -142,26 +158,12 @@ class HistorianStore:
     def ready(self) -> bool:
         return self.data_manager is not None
 
-    # ---------------------------------------------------------------- archive schema version
-    schema_version: int = ARCHIVE_SCHEMA_VERSION
-    """The archive schema version this historian's TENT writes; the database is checked to be of it at set-up."""
-
-    @staticmethod
-    def publisher_schema_version_problem(schema_version) -> str | None:
-        """
-        None when a registration's declared archive schema version is this historian's; otherwise the reason it is
-        refused, naming both versions. A registration that states no version comes from a TENT before 2 November 2026
-        (archive schema version 1) and is refused the same way; nothing is migrated or translated.
-        """
-        if schema_version == ARCHIVE_SCHEMA_VERSION and isinstance(schema_version, int):
-            return None
-        if schema_version is None:
-            described = 'does not state its archive schema version, so its TENT writes archive schema version 1'
-        else:
-            described = f'states archive schema version {schema_version!r}'
-        return (f'The publisher {described}; this historian\'s TENT writes archive schema version {ARCHIVE_SCHEMA_VERSION}. '
-                f'Nothing was registered. Run the publisher and the historian on TENT installations with the same archive '
-                f'schema version.')
+    # ---------------------------------------------------------------- what is registered
+    def schema_versions(self) -> dict[str, int]:
+        """The archive schema version recorded for each application that has registered with this database."""
+        if self.data_manager is None:
+            return {}
+        return {row['application']: row['version'] for row in self.data_manager.archive_schema_records()}
 
     @property
     def writable_tables(self) -> set[str]:
@@ -177,11 +179,22 @@ class HistorianStore:
             return set()
         return set(self.data_manager.definitions) - self.own_tables
 
+    @property
+    def registered_enumerations(self) -> dict[str, list[str]]:
+        """Enumeration name -> member names, for every enumeration registered with the data manager."""
+        if self.data_manager is None:
+            return {}
+        return {e['name']: e['members'] for e in self.data_manager.enumeration_definitions()}
+
     # ---------------------------------------------------------------- set-up
-    def setup(self, configured_definitions: Sequence[Mapping] = ()) -> None:
-        """Open the database, create the historian's tables, reload stored definitions, register configured ones."""
+    def setup(self, configured_definitions: Sequence[Mapping] = (),
+              configured_enumerations: Sequence[Mapping] = ()) -> None:
+        """Open the database, create the historian's tables, reload what is stored, and register the configured
+        enumerations and definitions (they belong to no application and carry no archive schema row)."""
         with self._lock:
             self._build_data_manager()
+            if configured_enumerations:
+                self._register_enumerations(check_enumerations(configured_enumerations))
             if configured_definitions:
                 result = self.register_definitions(configured_definitions)
                 if result.rejected:
@@ -216,18 +229,25 @@ class HistorianStore:
                     {'name': 'registered_time', 'type': 'DateTime', 'kwargs': {'nullable': False}},
                 ],
             },
+            {
+                'name': KNOWN_ENUMERATIONS,
+                'columns': [
+                    {'name': 'name', 'type': 'String', 'type_args': [63], 'kwargs': {'primary_key': True}},
+                    {'name': 'members', 'type': 'Text', 'kwargs': {'nullable': False}},
+                    {'name': 'registered_time', 'type': 'DateTime', 'kwargs': {'nullable': False}},
+                ],
+            },
         ]
 
     def _build_data_manager(self) -> None:
         data_manager = LocalDataManager(None, {'url': self.url})
+        data_manager.declare_multi_application()
         data_manager.add_tables(self._own_table_definitions())
-        try:
-            # Creates the historian's own tables when missing; writes the archive_schema row into a new database and
-            # refuses a database written with another archive schema version.
-            data_manager.init_archive()
-        except ArchiveSchemaMismatch as error:
-            raise ArchiveSchemaMismatch(error.database_version, error.tent_schema_version,
-                                        where=f'Historian database {self.redacted_url!r}') from error
+        data_manager.init_archive()  # creates the historian's own tables when missing; a host checks no schema here
+        enumerations = self._stored_enumerations(data_manager)
+        if enumerations:
+            data_manager.register_enumerations(enumerations.values())
+            _log.info(f'Reloaded {len(enumerations)} registered enumeration(s): {sorted(enumerations)}')
         stored = self._stored_definitions(data_manager)
         if stored:
             data_manager.add_tables(list(stored.values()))
@@ -250,20 +270,87 @@ class HistorianStore:
         rows = data_manager.query_data(KNOWN_TABLE_DEFINITIONS, order_by=[('registered_time', 'asc'), ('name', 'asc')])
         return {row['name']: json.loads(row['definition']) for row in rows}
 
+    @staticmethod
+    def _stored_enumerations(data_manager: LocalDataManager) -> dict[str, dict]:
+        rows = data_manager.query_data(KNOWN_ENUMERATIONS, order_by=[('name', 'asc')])
+        return {row['name']: {'name': row['name'], 'members': json.loads(row['members'])} for row in rows}
+
     # ---------------------------------------------------------------- registration
+    def register(self, payload) -> RegistrationResult:
+        """
+        One registration as a publisher sends it: {"definitions", "enumerations", "application", "schema_version",
+        "fingerprint", "application_version"}. The payload is taken apart (a malformed one is refused with the reason),
+        the application's archive schema is recorded or checked (another version than the one recorded for the
+        application, or tables of the application already in the database without a record, which is version 1, refuse
+        the whole registration naming both versions), the enumerations are registered (a malformed one, or a member
+        list that differs from the registered one, refuses the whole registration), and the definitions are registered
+        table by table (register_definitions). Raises only when the database itself fails.
+        """
+        try:
+            registration = parse_registration(payload)
+            schema = ArchiveSchema.from_payload(registration.schema)
+        except (ValueError, TypeError) as error:
+            _log.error(f'Registration refused: {error}')
+            return RegistrationResult.refused(str(error))
+        with self._lock:
+            self._require_ready()
+            where = f'Archive {self.redacted_url!r} (application {schema.application!r})'
+            if (schema.application not in self.schema_versions()
+                    and self._tables_of(registration.definitions) & (self.registered_tables | self.reflected_tables)):
+                # The application's tables predate its archive schema record: the unversioned past.
+                error = ArchiveSchemaMismatch(UNVERSIONED, schema.version, where, schema.application)
+                _log.error(f'Registration refused: {error}')
+                return RegistrationResult.refused(str(error), schema.application, UNVERSIONED)
+            try:
+                self.data_manager.register_application(schema)
+            except ArchiveSchemaMismatch as error:
+                _log.error(f'Registration refused: {error}')
+                return RegistrationResult.refused(str(error), schema.application, error.database_version)
+            try:
+                self._register_enumerations(check_enumerations(registration.enumerations))
+            except ValueError as error:
+                _log.error(f'Registration of {schema.application!r} refused: {error}')
+                return RegistrationResult.refused(f'Enumerations rejected: {error}', schema.application, schema.version)
+            result = self.register_definitions(registration.definitions)
+            result.application, result.schema_version = schema.application, schema.version
+            return result
+
+    @staticmethod
+    def _tables_of(definitions: Sequence) -> set[str]:
+        return {d['name'] for d in definitions if isinstance(d, Mapping) and isinstance(d.get('name'), str)}
+
+    def _register_enumerations(self, enumerations: Sequence[Mapping]) -> None:
+        """Register checked enumerations with the data manager (a known name with other members is the library's
+        ValueError) and persist the new ones."""
+        self._require_ready()
+        known = self.registered_enumerations
+        new = [e for e in enumerations if e['name'] not in known]
+        self.data_manager.register_enumerations(enumerations)
+        if new:
+            registered_time = datetime.now(timezone.utc)
+            for enumeration in new:
+                self.data_manager.upsert_data(KNOWN_ENUMERATIONS, {
+                    'name': enumeration['name'],
+                    'members': json.dumps(enumeration['members']),
+                    'registered_time': registered_time,
+                }, ['name'])
+            _log.info(f'Registered enumeration(s): {[e["name"] for e in new]}')
+
     def register_definitions(self, definitions: Sequence) -> RegistrationResult:
         """
         Check each definition, compare it with what is stored, persist and create the new ones. Tables are handled one
-        by one: a rejected table (invalid, or stored with a different definition) does not stop the others, and an
-        identical re-registration is accepted without change. Column order does not matter in the comparison; a new
-        table is created with its columns in the order given. Raises only when the database itself fails.
+        by one: a rejected table (invalid, naming an unregistered enumeration, or stored with a different definition)
+        does not stop the others, and an identical re-registration is accepted without change. Column order does not
+        matter in the comparison; a new table is created with its columns in the order given. Raises only when the
+        database itself fails.
         """
         with self._lock:
             self._require_ready()
             result = RegistrationResult()
             # Any table in the database other than the historian's own (registered or reflected) may be referred to.
             present = set(self.data_manager.tables) - self.own_tables
-            valid, rejected = check_definitions(definitions, reserved_names=self.own_tables, known_names=present)
+            valid, rejected = check_definitions(definitions, reserved_names=self.own_tables, known_names=present,
+                                                enumerations=set(self.registered_enumerations))
             result.rejected.update({name: {'message': message, 'differences': None}
                                     for name, message in rejected.items()})
             stored = self._stored_definitions(self.data_manager)

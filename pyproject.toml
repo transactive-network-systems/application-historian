@@ -5,7 +5,7 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 name = "volttron-application-historian"
 version = "3.0.0"
-description = "The Application Historian: a modular VOLTTRON historian storing application archive records through TENT's LocalDataManager"
+description = "The Application Historian: a modular VOLTTRON historian storing applications' archive records through lib-archivable's LocalDataManager"
 authors = ["VOLTTRON Team <volttron@pnnl.gov>"]
 license = "Apache-2.0"
 readme = "README.md"
@@ -30,8 +30,9 @@ classifiers = [
 python = "^3.11"
 volttron-core = ">=2.0.0rc0"
 volttron-lib-base-historian = { version = ">=2.0.0rc1", allow-prereleases = true }
-# tent (code/TENT in this project) is required and is installed into the platform with `vctl install-lib` or
-# `pip install -e ../TENT`; it is not on PyPI yet. It brings SQLAlchemy. See README.md.
+# lib-archivable (code/tns-utilities/lib-archivable in this project) brings the data manager and SQLAlchemy. It is not
+# on PyPI yet: install it into the platform first, with `vctl install-lib` or `pip install -e`. See README.md.
+lib-archivable = ">=0.1.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0.0"

@@ -1,18 +1,19 @@
-"""Table-definition parsing, allow-list validation and comparison."""
+"""Table-definition and enumeration parsing, allow-list validation and comparison."""
 import json
 
 import pytest
-from tent.data_manager.reader import known_archive_definitions
 
-from conftest import SAMPLE_DEFINITIONS
-from historian.application.definitions import (canonical_form, canonical_json, check_definitions,
-                                                      describe_difference, parse_definitions)
+from conftest import SAMPLE_DEFINITIONS, SAMPLE_ENUMERATIONS, registration
+from historian.application.definitions import (Registration, canonical_form, canonical_json, check_definitions,
+                                               check_enumerations, describe_difference, parse_definitions,
+                                               parse_registration)
 
-RESERVED = {"topics", "data", "known_table_definitions"}
+RESERVED = {"topics", "data", "known_table_definitions", "known_enumerations", "archive_schema"}
+ENUMERATIONS = {"MarketTypes"}
 
 
 def check(definitions, known=frozenset()):
-    return check_definitions(definitions, reserved_names=RESERVED, known_names=set(known))
+    return check_definitions(definitions, reserved_names=RESERVED, known_names=set(known), enumerations=ENUMERATIONS)
 
 
 def validate(definitions, known=frozenset()):
@@ -39,10 +40,47 @@ class TestParseDefinitions:
             parse_definitions(bad)
 
 
-class TestValidateDefinitions:
+class TestParseRegistration:
 
-    def test_every_definition_tent_ships_is_accepted(self):
-        validate(known_archive_definitions())
+    def test_a_full_payload_is_taken_apart(self):
+        parsed = parse_registration(registration())
+        assert parsed == Registration(SAMPLE_DEFINITIONS, SAMPLE_ENUMERATIONS,
+                                      {"application": "demo", "schema_version": 3, "fingerprint": "d" * 64,
+                                       "application_version": "1.2.3"})
+        assert parse_registration(json.dumps(registration())) == parsed
+
+    def test_a_bare_list_or_mapping_carries_no_schema_and_no_enumerations(self):
+        for payload in (SAMPLE_DEFINITIONS, {d["name"]: d for d in SAMPLE_DEFINITIONS}, {"definitions": SAMPLE_DEFINITIONS}):
+            parsed = parse_registration(payload)
+            assert parsed.definitions == SAMPLE_DEFINITIONS and parsed.enumerations is None and parsed.schema == {}
+
+    def test_enumerations_must_be_a_list(self):
+        with pytest.raises(ValueError, match='"enumerations" must be a list'):
+            parse_registration(registration(enumerations={"MarketTypes": ["auction"]}))
+
+
+class TestCheckEnumerations:
+
+    def test_canonical_form_and_none(self):
+        assert check_enumerations(SAMPLE_ENUMERATIONS) == SAMPLE_ENUMERATIONS
+        assert check_enumerations(None) == [] and check_enumerations([]) == []
+
+    @pytest.mark.parametrize("bad, problem", [
+        ([{"name": "MarketTypes"}], "non-empty list of member names"),
+        ([{"name": "MarketTypes", "members": []}], "non-empty list"),
+        ([{"name": "Market Types", "members": ["a"]}], "identifier"),
+        ([{"name": "MarketTypes", "members": ["a", "a"]}], "twice"),
+        ([{"name": "MarketTypes", "members": ["a"], "values": [1]}], "unsupported key"),
+        (["MarketTypes"], "mapping"),
+        ("MarketTypes", "must be a list"),
+        ([{"name": "MarketTypes", "members": ["a"]}, {"name": "MarketTypes", "members": ["b"]}], "defined twice"),
+    ])
+    def test_malformed_enumerations_are_errors(self, bad, problem):
+        with pytest.raises(ValueError, match=problem):
+            check_enumerations(bad)
+
+
+class TestValidateDefinitions:
 
     def test_test_schema_is_accepted(self):
         validate(SAMPLE_DEFINITIONS)
@@ -69,7 +107,8 @@ class TestValidateDefinitions:
         assert valid == [other]
         assert "was rejected" in rejected["child"] and "was rejected" in rejected["grandchild"]
 
-    @pytest.mark.parametrize("name", ["topics", "data", "known_table_definitions"])
+    @pytest.mark.parametrize("name", ["topics", "data", "known_table_definitions", "known_enumerations",
+                                      "archive_schema"])
     def test_reserved_names_are_refused(self, name):
         with pytest.raises(ValueError, match="reserved"):
             validate([{"name": name, "columns": [{"name": "x", "type": "Integer"}]}])
@@ -107,11 +146,15 @@ class TestValidateDefinitions:
         with pytest.raises(ValueError, match='needs a "type"'):
             validate([{"name": "t", "columns": [{"name": "x"}]}])
 
-    def test_enumeration_must_exist_in_tent(self):
-        with pytest.raises(ValueError, match="not an enumeration"):
+    def test_enumeration_must_be_in_the_registration_or_registered(self):
+        with pytest.raises(ValueError, match="names enumeration 'NoSuchEnum', which is neither in this registration's "
+                                             "enumerations nor already registered"):
             validate([{"name": "t", "columns": [{"name": "x", "enumeration": "NoSuchEnum"}]}])
-        with pytest.raises(ValueError, match="not an enumeration"):
-            validate([{"name": "t", "columns": [{"name": "x", "enumeration": "Enum"}]}])  # a class, not an enum
+        valid, rejected = check_definitions([{"name": "t", "columns": [{"name": "x", "enumeration": "MarketTypes"}]}],
+                                            reserved_names=RESERVED, known_names=set())  # no enumerations at all
+        assert valid == [] and "neither in this registration" in rejected["t"]
+        with pytest.raises(ValueError, match="identifier"):
+            validate([{"name": "t", "columns": [{"name": "x", "enumeration": "not an identifier"}]}])
 
     @pytest.mark.parametrize("fk", ["component", "component.id.extra", "comp onent.id", 5])
     def test_foreign_key_must_be_table_dot_column(self, fk):

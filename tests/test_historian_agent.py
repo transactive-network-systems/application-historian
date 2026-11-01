@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
-from conftest import SAMPLE_DEFINITIONS, envelope_record, registration, standard_record
-from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
+from archivable import ARCHIVE_SCHEMA_TABLE
+
+from conftest import (APPLICATION, FINGERPRINT, SAMPLE_DEFINITIONS, SAMPLE_ENUMERATIONS, SCHEMA_VERSION, envelope_record,
+                      registration, standard_record)
 from historian.application import agent as agent_module
 from historian.application.store import KNOWN_TABLE_DEFINITIONS
 from historian.application.agent import (DEFAULT_VIP_IDENTITY, ApplicationHistorian,
@@ -48,7 +50,7 @@ def test_agent_config_values_become_the_config_store_defaults(connection):
     agent = historian({"connection": connection, "tables_def": {"table_prefix": "p"}, "retry_period": 10})
     assert agent._default_config["connection"] == connection
     assert agent._default_config["tables_def"] == {"table_prefix": "p"}
-    assert agent._default_config["table_definitions"] == []
+    assert agent._default_config["table_definitions"] == [] and agent._default_config["enumerations"] == []
     assert agent.init_kwargs["retry_period"] == 10
     assert agent.table_names["data_table"] == "p_data"
 
@@ -101,39 +103,40 @@ def test_setup_and_publish_before_configure_fail_loudly():
     assert agent.handled_all == 0
 
 
-def test_new_database_gets_the_archive_schema_row_at_setup(connection, db_url):
+def test_setup_creates_the_archive_schema_table_and_registrations_fill_it(connection, db_url):
     agent = running_historian(connection)
     assert ARCHIVE_SCHEMA_TABLE in inspect(create_engine(db_url)).get_table_names()
-    assert agent.store.data_manager.schema_version == ARCHIVE_SCHEMA_VERSION
+    assert agent.store.schema_versions() == {}
+    agent.create_tables(registration())
+    assert agent.store.schema_versions() == {APPLICATION: SCHEMA_VERSION}
     agent.historian_setup()  # a restart on the same database
-    assert agent.store.data_manager.schema_version == ARCHIVE_SCHEMA_VERSION
+    assert agent.store.schema_versions() == {APPLICATION: SCHEMA_VERSION}
 
 
-def test_setup_refuses_a_database_of_another_schema_version(connection, db_url):
-    running_historian(connection)
+def test_an_applications_recorded_version_is_checked_on_every_registration(connection, db_url):
+    running_historian(connection).create_tables(registration())
     with create_engine(db_url).begin() as conn:
-        conn.execute(text(f"UPDATE {ARCHIVE_SCHEMA_TABLE} SET version = 1"))
-    agent = ApplicationHistorian()
-    agent.configure({"connection": connection})
-    with pytest.raises(ArchiveSchemaMismatch) as error:
-        agent.historian_setup()
-    message = str(error.value)
-    assert "Historian database" in message and "version 1" in message and f"version {ARCHIVE_SCHEMA_VERSION}" in message
-    assert not agent.store.ready
+        conn.execute(text(f"UPDATE {ARCHIVE_SCHEMA_TABLE} SET version = 2"))
+    agent = running_historian(connection)  # starts: a host checks no schema of its own
+    reply = agent.create_tables(registration())
+    assert reply["status"] == "error" and reply["registered_tables"] == []
+    assert f"(application {APPLICATION!r})" in reply["message"] and "version 2" in reply["message"]
+    assert f"version {SCHEMA_VERSION}" in reply["message"]
+    assert (reply["application"], reply["schema_version"]) == (APPLICATION, 2)
 
 
-def test_setup_refuses_a_database_from_before_the_version_was_recorded(connection, db_url):
-    running_historian(connection)
+def test_an_applications_tables_from_before_the_record_are_version_one(connection, db_url):
+    running_historian(connection).create_tables(registration())
     with create_engine(db_url).begin() as conn:
         conn.execute(text(f"DROP TABLE {ARCHIVE_SCHEMA_TABLE}"))
-    agent = ApplicationHistorian()
-    agent.configure({"connection": connection})
-    with pytest.raises(ArchiveSchemaMismatch, match=f"version 1;.*version {ARCHIVE_SCHEMA_VERSION}"):
-        agent.historian_setup()
+    agent = running_historian(connection)
+    reply = agent.create_tables(registration())
+    assert reply["status"] == "error" and f"version 1; {APPLICATION} writes archive schema version {SCHEMA_VERSION}" in reply["message"]
+    assert reply["schema_version"] == 1
 
 
 def test_configured_table_definitions_are_created_at_setup(connection, db_url):
-    agent = running_historian(connection, table_definitions=SAMPLE_DEFINITIONS)
+    agent = running_historian(connection, table_definitions=SAMPLE_DEFINITIONS, enumerations=SAMPLE_ENUMERATIONS)
     assert {"component", "market", "time_interval"} <= set(inspect(create_engine(db_url)).get_table_names())
     assert agent.store.registered_tables == {"component", "market", "time_interval"}
 
@@ -150,7 +153,7 @@ def test_create_tables_registers_persists_and_reports(connection, db_url):
     assert reply["registered_tables"] == ["component", "market", "time_interval"]
     assert reply["rejected_tables"] == {}
     assert "3 table(s) created" in reply["message"]
-    assert set(reply) == {"status", "registered_tables", "rejected_tables", "message", "schema_version"}
+    assert set(reply) == {"status", "registered_tables", "rejected_tables", "message", "application", "schema_version"}
     assert KNOWN_TABLE_DEFINITIONS in inspect(create_engine(db_url)).get_table_names()
     again = agent.create_tables(registration())  # a second publisher registering the same schema
     assert again["status"] == "success" and again["registered_tables"] == ["component", "market", "time_interval"]
@@ -163,33 +166,47 @@ def test_create_tables_accepts_the_mapping_form(connection):
     assert reply["status"] == "success"
 
 
-def test_create_tables_without_a_schema_version_is_refused_and_registers_nothing(connection):
-    """A bare list or mapping of definitions is what a publisher of TENT before 2 November 2026 sends."""
+def test_create_tables_without_a_schema_is_refused_and_registers_nothing(connection):
+    """A bare list or mapping of definitions is what a publisher from before the archive schema was versioned sends."""
     agent = running_historian(connection)
     for payload in (SAMPLE_DEFINITIONS, {d["name"]: d for d in SAMPLE_DEFINITIONS}, {"definitions": SAMPLE_DEFINITIONS}):
         reply = agent.create_tables(payload)
         assert reply["status"] == "error" and reply["registered_tables"] == [] and reply["rejected_tables"] == {}
-        assert "does not state its archive schema version" in reply["message"]
-        assert "version 1" in reply["message"] and f"version {ARCHIVE_SCHEMA_VERSION}" in reply["message"]
-        assert reply["schema_version"] == ARCHIVE_SCHEMA_VERSION
+        assert "states no application, schema_version, fingerprint" in reply["message"]
+        assert reply["schema_version"] is None and reply["application"] is None
     assert agent.store.registered_tables == set()
 
 
 def test_create_tables_with_another_schema_version_is_refused_naming_both(connection):
     agent = running_historian(connection)
-    reply = agent.create_tables(registration(schema_version=ARCHIVE_SCHEMA_VERSION + 1))
+    agent.create_tables(registration())
+    reply = agent.create_tables(registration(schema_version=SCHEMA_VERSION + 1))
     assert reply["status"] == "error" and reply["registered_tables"] == []
-    assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in reply["message"]
-    assert f"version {ARCHIVE_SCHEMA_VERSION}" in reply["message"]
-    assert agent.store.registered_tables == set()
-    reply = agent.create_tables(registration(schema_version=str(ARCHIVE_SCHEMA_VERSION)))  # a string is not a version
-    assert reply["status"] == "error" and agent.store.registered_tables == set()
+    assert f"version {SCHEMA_VERSION + 1}" in reply["message"]
+    assert f"version {SCHEMA_VERSION}" in reply["message"]
+    assert reply["schema_version"] == SCHEMA_VERSION, "the version the historian holds for the application"
+    reply = agent.create_tables(registration(schema_version=str(SCHEMA_VERSION)))  # a string is not a version
+    assert reply["status"] == "error" and "not an integer" in reply["message"]
+    assert agent.store.schema_versions() == {APPLICATION: SCHEMA_VERSION}
 
 
-def test_replies_carry_the_historians_schema_version(connection):
+def test_replies_carry_the_application_and_its_recorded_schema_version(connection):
     agent = running_historian(connection)
-    assert agent.create_tables(registration())["schema_version"] == ARCHIVE_SCHEMA_VERSION
-    assert agent.create_tables("not json")["schema_version"] == ARCHIVE_SCHEMA_VERSION
+    reply = agent.create_tables(registration())
+    assert (reply["application"], reply["schema_version"]) == (APPLICATION, SCHEMA_VERSION)
+    reply = agent.create_tables("not json")
+    assert reply["status"] == "error" and reply["application"] is None and reply["schema_version"] is None
+
+
+def test_enumerations_travel_with_the_registration_and_decode_the_rows(connection):
+    agent = running_historian(connection)
+    reply = agent.create_tables(registration(enumerations=None))
+    assert reply["status"] == "partial" and reply["registered_tables"] == ["component"]
+    assert "names enumeration 'MarketTypes'" in reply["rejected_tables"]["market"]["message"]
+    assert agent.create_tables(registration())["status"] == "success"
+    assert agent.store.registered_enumerations == {"MarketTypes": ["auction", "consensus", "matching"]}
+    agent.publish_to_historian([envelope_record([market_envelope()])])
+    assert agent.store.data_manager.query_data("market")[0]["market_type"].name == "consensus"
 
 
 def test_create_tables_reports_a_changed_definition_and_registers_the_rest(connection):
@@ -315,10 +332,9 @@ def test_mixed_batch_routes_by_payload_shape(connection):
 
 # ---------------------------------------------------------------- pubsub registration path
 def definitions_message(definitions=SAMPLE_DEFINITIONS, publisher="campus", request_id="req-1",
-                        schema_version=ARCHIVE_SCHEMA_VERSION):
-    value = {"publisher": publisher, "request_id": request_id, "definitions": definitions}
-    if schema_version is not None:
-        value["schema_version"] = schema_version
+                        schema_version=SCHEMA_VERSION):
+    value = {"publisher": publisher, "request_id": request_id,
+             **registration(definitions, schema_version=schema_version)}
     return standard_record(topic=f"app/archive/{publisher}/definitions", value=value)
 
 
@@ -332,7 +348,7 @@ def test_definitions_message_registers_and_publishes_success(connection):
     assert headers["Date"] and headers["TimeStamp"]
     assert message == {"request_id": "req-1", "publisher": "campus", "status": "success",
                        "registered_tables": ["component", "market", "time_interval"], "rejected_tables": {},
-                       "message": message["message"], "schema_version": ARCHIVE_SCHEMA_VERSION}
+                       "message": message["message"], "application": APPLICATION, "schema_version": SCHEMA_VERSION}
     agent.publish_to_historian([definitions_message(request_id="req-2")])  # idempotent
     assert agent.vip.pubsub.published[-1][2]["status"] == "success"
     assert agent.vip.pubsub.published[-1][2]["request_id"] == "req-2"
@@ -363,19 +379,20 @@ def test_definitions_message_partial_and_error_status(connection):
 
 def test_definitions_message_of_another_schema_version_gets_an_error_status_and_registers_nothing(connection):
     agent = running_historian(connection)
-    agent.publish_to_historian([definitions_message(request_id="req-v", schema_version=ARCHIVE_SCHEMA_VERSION + 1)])
+    agent.create_tables(registration(definitions=SAMPLE_DEFINITIONS[:1]))  # the application is on record at SCHEMA_VERSION
+    agent.publish_to_historian([definitions_message(request_id="req-v", schema_version=SCHEMA_VERSION + 1)])
     [(topic, _, status)] = agent.vip.pubsub.published
     assert topic == "app/archive/campus/status" and status["request_id"] == "req-v"
     assert status["status"] == "error" and status["registered_tables"] == []
-    assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in status["message"]
-    assert f"version {ARCHIVE_SCHEMA_VERSION}" in status["message"]
-    assert status["schema_version"] == ARCHIVE_SCHEMA_VERSION
-    assert agent.store.registered_tables == set()
+    assert f"version {SCHEMA_VERSION + 1}" in status["message"]
+    assert f"version {SCHEMA_VERSION}" in status["message"]
+    assert status["schema_version"] == SCHEMA_VERSION and status["application"] == APPLICATION
+    assert agent.store.registered_tables == {"component"}
 
     agent.publish_to_historian([definitions_message(request_id="req-n", schema_version=None)])
     status = agent.vip.pubsub.published[-1][2]
-    assert status["status"] == "error" and "does not state its archive schema version" in status["message"]
-    assert agent.store.registered_tables == set()
+    assert status["status"] == "error" and "states no schema_version" in status["message"]
+    assert agent.store.registered_tables == {"component"}
 
 
 def test_malformed_definitions_message_gets_an_error_status_only_with_a_request_id(connection, caplog):
@@ -420,8 +437,7 @@ def test_status_publish_failure_is_logged_not_raised(connection, caplog):
 def test_records_topic_with_a_different_prefix_is_still_routed(connection):
     agent = running_historian(connection)
     agent.publish_to_historian([standard_record(topic="other/prefix/archive/city/definitions",
-                                                value={"publisher": "city", "request_id": "r", "definitions":
-                                                       SAMPLE_DEFINITIONS, "schema_version": ARCHIVE_SCHEMA_VERSION}),
+                                                value={"publisher": "city", "request_id": "r", **registration()}),
                                 envelope_record([market_envelope()], topic="other/prefix/archive/city/records",
                                                 record_id=2)])
     assert agent.vip.pubsub.published[0][0] == "other/prefix/archive/city/status"

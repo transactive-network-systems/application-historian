@@ -9,7 +9,7 @@ poetry = "*"
 
 [pypi-dependencies]
 volttron-core = { path = "../volttron-core", editable = true }
-tent = { path = "../TENT", editable = true }
+lib-archivable = { path = "../tns-utilities/lib-archivable", editable = true }
 volttron-application-historian = { path = ".", editable = true }
 
 [tasks]

@@ -1,25 +1,29 @@
 """
-Table definitions the historian accepts over the `create_tables` RPC and from its own configuration.
+Table definitions and enumerations the historian accepts over the `create_tables` RPC, the definitions topic and its
+own configuration.
 
-A definition is the JSON structure TENT components return from `get_archive_definitions()` and
-`tent.data_manager.DataManager._parse_table_definition` turns into a SQLAlchemy `Table`. Because the RPC lets a peer
-run DDL in the historian's database, every key is checked against an allow-list before it reaches SQLAlchemy: column
-types are limited to the names below, column keyword arguments to a few booleans, and the table-level keyword arguments
+A definition is the JSON structure an application's archivable classes declare (`get_archive_definitions()`) and the
+lib-archivable data manager turns into a SQLAlchemy `Table` (`archivable.definitions`). Because the RPC lets a peer run
+DDL in the historian's database, every key is checked against an allow-list before it reaches SQLAlchemy: column types
+are limited to the names below, column keyword arguments to a few booleans, and the table-level keyword arguments
 SQLAlchemy would otherwise pass straight to `Table(...)` (`quote`, `prefixes`, `schema`, ...) are not accepted at all.
+A column's `enumeration` must be among the enumerations the registration carries or those already registered.
 
 `check_definitions` reports a problem per table, so a registration with one bad table can still register the others.
+`parse_registration` splits a registration payload into its definitions, its enumerations and the application's archive
+schema; `check_enumerations` validates the enumerations through the library's wire form.
 
 The canonical form (`canonical_form`, `canonical_json`) is what the historian compares when a table is registered a
 second time and what `describe_difference` diffs: keys sorted, columns sorted by name. Column order therefore does not
 matter for the comparison; the table is created with the columns in the order the first registration gave them.
 """
 import difflib
-import enum
 import json
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
-import tent.enumerations
+from archivable import ArchiveSchema, enumeration_definition, enumeration_from_definition
 
 IDENTIFIER = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}$')
 QUALIFIED_COLUMN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,62}\.[A-Za-z_][A-Za-z0-9_]{0,62}$')
@@ -57,18 +61,58 @@ def parse_definitions(definitions) -> list[dict]:
     return [dict(d) if isinstance(d, Mapping) else d for d in definitions]
 
 
-def parse_registration(payload) -> tuple[list[dict], object]:
+@dataclass
+class Registration:
+    """A registration payload taken apart: the table definitions, the enumerations they may name (None when the
+    payload carries no "enumerations" key) and the application's archive schema as sent (the keys of
+    ArchiveSchema.PAYLOAD_KEYS, whatever of them the payload has)."""
+    definitions: list[dict]
+    enumerations: list | None
+    schema: dict = field(default_factory=dict)
+
+
+def parse_registration(payload) -> Registration:
     """
-    Split a registration payload into (definitions, schema_version). A publisher sends
-    {"definitions": [...], "schema_version": N}, N being its TENT's tent.data_manager.ARCHIVE_SCHEMA_VERSION; the
-    definitions themselves may take any form parse_definitions accepts. schema_version is None when the payload is a
-    bare list, a {name: definition} mapping or a wrapper without the key: a publisher whose TENT predates the version
-    (2 November 2026, archive schema version 1). The caller decides what to do with it; this only reads the message.
+    Take a registration payload apart. A publisher sends {"definitions": [...], "enumerations": [...],
+    "application", "schema_version", "fingerprint", "application_version"}; the definitions themselves may take any
+    form parse_definitions accepts. A bare list or a {name: definition} mapping carries no schema and no enumerations
+    (a publisher from before the archive schema was versioned); the caller refuses it. This only reads the message; an
+    "enumerations" value that is not a list is a ValueError.
     """
     if isinstance(payload, str):
         payload = json.loads(payload)
-    schema_version = payload.get('schema_version') if isinstance(payload, Mapping) and 'definitions' in payload else None
-    return parse_definitions(payload), schema_version
+    enumerations = None
+    schema: dict = {}
+    if isinstance(payload, Mapping) and 'definitions' in payload:
+        if 'enumerations' in payload:
+            enumerations = payload['enumerations']
+            if not isinstance(enumerations, Sequence) or isinstance(enumerations, (str, bytes)):
+                raise ValueError(f'"enumerations" must be a list of {{"name", "members"}} definitions, not '
+                                 f'{type(enumerations).__name__}.')
+            enumerations = list(enumerations)
+        schema = {key: payload[key] for key in ArchiveSchema.PAYLOAD_KEYS if key in payload}
+    return Registration(parse_definitions(payload), enumerations, schema)
+
+
+def check_enumerations(enumerations: Sequence | None) -> list[dict]:
+    """
+    The enumerations of a registration in canonical wire form ({"name", "members"}), checked through the library (a
+    name that is not an identifier, no or duplicate members, unknown keys). None (no "enumerations" key) is an empty
+    list. The first problem is raised as a ValueError: a registration whose enumerations are malformed is refused
+    whole, since every table naming one would be wrong.
+    """
+    if enumerations is not None and (not isinstance(enumerations, Sequence) or isinstance(enumerations, (str, bytes))):
+        raise ValueError(f'"enumerations" must be a list of {{"name", "members"}} definitions, not '
+                         f'{type(enumerations).__name__}.')
+    checked = []
+    seen = set()
+    for definition in enumerations or ():
+        canonical = enumeration_definition(enumeration_from_definition(definition))
+        if canonical['name'] in seen:
+            raise ValueError(f'Enumeration {canonical["name"]!r} is defined twice in one registration.')
+        seen.add(canonical['name'])
+        checked.append(canonical)
+    return checked
 
 
 def canonical_form(definition: Mapping) -> dict:
@@ -92,13 +136,14 @@ def describe_difference(stored: Mapping, offered: Mapping) -> str:
     return '\n'.join(difflib.unified_diff(before, after, fromfile='registered', tofile='offered', lineterm=''))
 
 
-def check_definitions(definitions: Sequence, reserved_names: set[str],
-                      known_names: set[str]) -> tuple[list[dict], dict[str, str]]:
+def check_definitions(definitions: Sequence, reserved_names: set[str], known_names: set[str],
+                      enumerations: set[str] = frozenset()) -> tuple[list[dict], dict[str, str]]:
     """
     Check each definition on its own and return (valid definitions in the order given, {table: reason} for the
     rejected ones). A definition without a usable name is keyed "#<position>". `reserved_names` are the historian's
-    own tables, which may not be defined; `known_names` are tables already registered, which `inherits` may refer to.
-    A table whose parent is rejected, or is neither in the batch nor known, is rejected too.
+    own tables, which may not be defined; `known_names` are tables already registered, which `inherits` may refer to;
+    `enumerations` are the names a column's `enumeration` may take (those the registration carries and those already
+    registered). A table whose parent is rejected, or is neither in the batch nor known, is rejected too.
     """
     valid: list[dict] = []
     rejected: dict[str, str] = {}
@@ -109,7 +154,7 @@ def check_definitions(definitions: Sequence, reserved_names: set[str],
         try:
             if not isinstance(definition, Mapping):
                 raise ValueError(f'Each table definition must be a mapping, not {type(definition).__name__}.')
-            _validate_table(definition, reserved_names)
+            _validate_table(definition, reserved_names, enumerations)
             if name in names_in_batch:
                 raise ValueError(f'Table {name!r} is defined twice in one registration.')
         except ValueError as error:
@@ -164,7 +209,7 @@ def reject_unresolved(valid: list[dict], rejected: dict[str, str], available: se
             changed = True
 
 
-def _validate_table(definition: Mapping, reserved_names: set[str]) -> None:
+def _validate_table(definition: Mapping, reserved_names: set[str], enumerations: set[str]) -> None:
     name = definition.get('name')
     _require_identifier(name, 'table name')
     if name in reserved_names:
@@ -178,7 +223,7 @@ def _validate_table(definition: Mapping, reserved_names: set[str]) -> None:
         raise ValueError(f'Table {name!r}: "columns" must be a non-empty list.')
     column_names: set[str] = set()
     for column in columns:
-        _validate_column(name, column)
+        _validate_column(name, column, enumerations)
         if column['name'] in column_names:
             raise ValueError(f'Table {name!r}: column {column["name"]!r} is defined twice.')
         column_names.add(column['name'])
@@ -197,7 +242,7 @@ def _require_identifier(value, what: str) -> None:
                          f'got {value!r}.')
 
 
-def _validate_column(table: str, column) -> None:
+def _validate_column(table: str, column, enumerations: set[str]) -> None:
     if not isinstance(column, Mapping):
         raise ValueError(f'Table {table!r}: each column must be a mapping, not {type(column).__name__}.')
     name = column.get('name')
@@ -219,9 +264,9 @@ def _validate_column(table: str, column) -> None:
     enumeration = column.get('enumeration')
     if enumeration is not None:
         _require_identifier(enumeration, f'{where}: "enumeration"')
-        enum_class = getattr(tent.enumerations, enumeration, None)
-        if not (isinstance(enum_class, type) and issubclass(enum_class, enum.Enum)):
-            raise ValueError(f'{where}: {enumeration!r} is not an enumeration in tent.enumerations.')
+        if enumeration not in enumerations:
+            raise ValueError(f'{where}: names enumeration {enumeration!r}, which is neither in this registration\'s '
+                             f'enumerations nor already registered.')
     foreign_key = column.get('foreign_key')
     if foreign_key is not None and not (isinstance(foreign_key, str) and QUALIFIED_COLUMN.match(foreign_key)):
         raise ValueError(f'{where}: "foreign_key" must be "table.column", got {foreign_key!r}.')

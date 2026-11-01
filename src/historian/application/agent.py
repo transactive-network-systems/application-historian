@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-The Application Historian: a modular VOLTTRON historian that stores an application's archive records in a SQLAlchemy
-database through TENT's LocalDataManager, beside the platform's standard records.
+The Application Historian: a modular VOLTTRON historian that stores applications' archive records in a SQLAlchemy
+database through lib-archivable's LocalDataManager, beside the platform's standard records.
 
 It serves two kinds of record through one BaseHistorian subscription set:
 
@@ -13,9 +13,9 @@ It serves two kinds of record through one BaseHistorian subscription set:
   definitions, either with the `create_tables` RPC (default) or by publishing them on
   `<prefix>/archive/<publisher>/definitions`; the historian answers the pubsub path on
   `<prefix>/archive/<publisher>/status`. Envelopes are stored in the registered archive tables. A registration
-  states the publisher's archive schema version (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`) beside its definitions
-  and is refused when it is not the version this historian's TENT writes; the database itself is refused at start-up
-  when it was written with another version.
+  states its application's archive schema (application, version, fingerprint) and the enumerations its tables name
+  beside its definitions; the historian keeps one archive_schema row per application and refuses a registration whose
+  version differs from the one it recorded for that application.
 
 `<publisher>` is an opaque segment chosen by the publisher; the historian only echoes it in its status replies. Topics
 under `<prefix>/archive/` are routed by their last segment (records, definitions, status); every other captured topic
@@ -42,7 +42,7 @@ from volttron.client.messaging import headers as headers_mod
 from volttron.client.vip.agent import RPC
 from volttron.utils import load_config, vip_main
 
-from historian.application.definitions import parse_definitions, parse_registration
+from historian.application.definitions import check_enumerations, parse_definitions
 from historian.application.store import HistorianStore, RegistrationResult
 
 __version__ = "3.0.0"
@@ -58,6 +58,8 @@ RECORDS_TOPIC, DEFINITIONS_TOPIC, STATUS_TOPIC = "records", "definitions", "stat
 CONFIGURATION_HELP = ('Store the historian configuration as the config-store entry "config" of the historian\'s VIP '
                       'identity, e.g. vctl config store <identity> config <config file>. It must contain '
                       '{"connection": {"params": {"url": "<SQLAlchemy URL>"}}}.')
+REGISTRATION_KEYS = ('{"publisher", "request_id", "definitions", "enumerations", "application", "schema_version", '
+                     '"fingerprint", "application_version"}')
 
 
 def historian(config_path, **kwargs):
@@ -69,11 +71,13 @@ def historian(config_path, **kwargs):
     connection = config.pop("connection", None)
     tables_def = config.pop("tables_def", None)
     table_definitions = config.pop("table_definitions", None)
+    enumerations = config.pop("enumerations", None)
     kwargs.update(config)
     return ApplicationHistorian(
         connection=connection,
         tables_def=tables_def,
         table_definitions=table_definitions,
+        enumerations=enumerations,
         **kwargs,
     )
 
@@ -81,7 +85,7 @@ def historian(config_path, **kwargs):
 class ApplicationHistorian(BaseHistorian):
     """Store standard VOLTTRON records and registered application archive records in one SQLAlchemy database."""
 
-    def __init__(self, connection=None, tables_def=None, table_definitions=None, **kwargs):
+    def __init__(self, connection=None, tables_def=None, table_definitions=None, enumerations=None, **kwargs):
         # The RPC handlers (create_tables, queries) run on the agent's greenlets; the publishing loop must as well so
         # that the data manager is never touched from a second OS thread.
         if not kwargs.pop("process_loop_in_greenlet", True):
@@ -91,12 +95,14 @@ class ApplicationHistorian(BaseHistorian):
         self.connection = connection
         self.tables_def, self.table_names = self.parse_table_def(tables_def)
         self.configured_table_definitions = parse_definitions(table_definitions)
+        self.configured_enumerations = check_enumerations(enumerations)
         self.store: HistorianStore | None = None
         super().__init__(process_loop_in_greenlet=True, **kwargs)
         self.update_default_config({
             "connection": connection,
             "tables_def": tables_def,
             "table_definitions": self.configured_table_definitions,
+            "enumerations": self.configured_enumerations,
         })
 
     # ---------------------------------------------------------------- BaseHistorian contract
@@ -110,19 +116,21 @@ class ApplicationHistorian(BaseHistorian):
             raise ValueError(f'The historian has no "connection"; nothing will be stored. {CONFIGURATION_HELP}')
         self.tables_def, self.table_names = self.parse_table_def(configuration.get("tables_def"))
         self.configured_table_definitions = parse_definitions(configuration.get("table_definitions"))
+        self.configured_enumerations = check_enumerations(configuration.get("enumerations"))
         self.store = HistorianStore(connection, self.table_names)  # raises ValueError for a URL that is not SQLAlchemy's
         self.connection = connection
         _log.info(f"Historian database: {self.store.redacted_url}")
 
     def historian_setup(self):
-        """Open the database, create the historian's tables and reload the registered table definitions. A database
-        written with another archive schema version raises ArchiveSchemaMismatch (both versions in the message); the
-        historian then does not start, and the operator recreates the database or runs the matching TENT."""
+        """Open the database, create the historian's tables and reload the registered enumerations and table
+        definitions, then register the configured ones (a rejected configured definition raises and the historian does
+        not start)."""
         if self.store is None:
             raise RuntimeError(f'The historian is not configured (see the configuration error logged above). '
                                f'{CONFIGURATION_HELP}')
-        self.store.setup(self.configured_table_definitions)
-        _log.info(f"Historian ready; archive tables: {sorted(self.store.writable_tables)}")
+        self.store.setup(self.configured_table_definitions, self.configured_enumerations)
+        _log.info(f"Historian ready; archive tables: {sorted(self.store.writable_tables)}; applications: "
+                  f"{self.store.schema_versions()}")
 
     def publish_to_historian(self, to_publish_list):
         """
@@ -170,21 +178,20 @@ class ApplicationHistorian(BaseHistorian):
     # ---------------------------------------------------------------- pubsub registration path
     def _handle_definitions_message(self, prefix, publisher, message):
         """
-        Register the definitions in a `{"publisher", "request_id", "definitions", "schema_version"}` message and
-        publish the outcome on `<prefix>/archive/<publisher>/status`. A malformed message is logged; it gets an "error"
-        status reply only when it carries a request_id to answer.
+        Register the definitions in a `{"publisher", "request_id", "definitions", "enumerations", "application",
+        "schema_version", "fingerprint", "application_version"}` message and publish the outcome on
+        `<prefix>/archive/<publisher>/status`. A malformed message is logged; it gets an "error" status reply only when
+        it carries a request_id to answer.
         """
         request_id = message.get("request_id") if isinstance(message, Mapping) else None
         if not isinstance(request_id, str) or not request_id:
             request_id = None
         if not isinstance(message, Mapping) or "definitions" not in message:
             _log.error(f'Malformed definitions message from publisher {publisher!r} on {prefix}/{ARCHIVE_SEGMENT}/'
-                       f'{publisher}/{DEFINITIONS_TOPIC}: expected {{"publisher", "request_id", "definitions", '
-                       f'"schema_version"}}, got {str(message)[:200]!r}')
+                       f'{publisher}/{DEFINITIONS_TOPIC}: expected {REGISTRATION_KEYS}, got {str(message)[:200]!r}')
             if request_id is not None:
                 self._publish_status(prefix, publisher, request_id, self._error_reply(
-                    'Malformed definitions message: expected {"publisher", "request_id", "definitions", '
-                    '"schema_version"}.'))
+                    f'Malformed definitions message: expected {REGISTRATION_KEYS}.'))
             return
         named = message.get("publisher")
         if named is not None and named != publisher:
@@ -193,7 +200,7 @@ class ApplicationHistorian(BaseHistorian):
         if request_id is None:
             _log.error(f'Definitions message from publisher {publisher!r} has no request_id; the publisher cannot '
                        f'match a reply. The definitions are registered anyway.')
-        reply = self._register({"definitions": message["definitions"], "schema_version": message.get("schema_version")})
+        reply = self._register({key: value for key, value in message.items() if key not in ("publisher", "request_id")})
         if request_id is not None:
             self._publish_status(prefix, publisher, request_id, reply)
 
@@ -210,24 +217,28 @@ class ApplicationHistorian(BaseHistorian):
                        f"on {topic!r}: {exc!r}. Outcome was: {reply['status']}: {reply['message']}")
 
     # ---------------------------------------------------------------- archive table registration
-    # ---------------------------------------------------------------- TENT archive registration
     @RPC.export
     def create_tables(self, definitions):
         """
-        Register archive table definitions (the structure TENT's `get_archive_definitions` returns) and create the
-        tables. The argument is `{"definitions": [...], "schema_version": N}`: the publisher's definitions and its
-        TENT's `tent.data_manager.ARCHIVE_SCHEMA_VERSION`. A registration whose schema version is not the one this
-        historian's TENT writes, or that states none (a TENT before 2 November 2026), is refused with "error" naming
-        both versions and nothing is registered. Each definition is then checked against an allow-list of keys, column
-        types and column keywords, persisted in `known_table_definitions`, and compared with the stored definition
-        when its table is registered again (column order does not matter). Tables are handled one by one: the
-        unchanged ones are registered even when another in the same call is rejected.
+        Register an application's archive tables and create them. The argument is `{"definitions": [...],
+        "enumerations": [...], "application", "schema_version", "fingerprint", "application_version"}`: the table
+        definitions (the structure an application's archivable classes declare), the enumerations their columns name
+        (`{"name", "members"}` each) and the application's archive schema. The application's schema is recorded on its
+        first registration and checked afterwards: a registration whose version differs from the recorded one, one
+        whose tables are already in the database without a record (version 1), or one that states no application,
+        version or fingerprint is refused with "error" (naming both versions where there are two) and nothing is
+        registered. The enumerations are registered next (a malformed one or a changed member list refuses the whole
+        registration). Each definition is then checked against an allow-list of keys, column types and column
+        keywords (an `enumeration` must be in the registration or already registered), persisted in
+        `known_table_definitions`, and compared with the stored definition when its table is registered again (column
+        order does not matter). Tables are handled one by one: the unchanged ones are registered even when another in
+        the same call is rejected.
 
         Returns {"status": "success" | "partial" | "error", "registered_tables": [accepted names],
         "rejected_tables": {name: {"message": str, "differences": unified diff or None}}, "message": str,
-        "schema_version": the historian's archive schema version}; "success" means every table is registered (created
-        now or already known and identical), "partial" that at least one was and at least one was rejected, "error"
-        that none was.
+        "application": the application registered for, "schema_version": the archive schema version the historian
+        holds for it}; "success" means every table is registered (created now or already known and identical),
+        "partial" that at least one was and at least one was rejected, "error" that none was.
 
         This RPC runs DDL; the modular platform has no `RPC.allow` decorator, so protect it per deployment:
         `vctl authz add agent <historian identity> --protected-rpcs create_tables` and give each publisher
@@ -239,16 +250,7 @@ class ApplicationHistorian(BaseHistorian):
 
     def _register(self, payload):
         try:
-            definitions, schema_version = parse_registration(payload)
-        except ValueError as exc:  # unparsable request (not JSON, not a list or mapping)
-            _log.error(f"Table registration rejected: {exc}")
-            return self._error_reply(str(exc))
-        problem = self.store.publisher_schema_version_problem(schema_version)
-        if problem is not None:
-            _log.error(f"Table registration refused: {problem}")
-            return self._error_reply(problem)
-        try:
-            result = self.store.register_definitions(definitions)
+            result = self.store.register(payload)
         except Exception as exc:  # the database itself failed; nothing was registered
             _log.exception("Table registration failed")
             return self._error_reply(f"Registration failed: {exc!r}")
@@ -261,13 +263,14 @@ class ApplicationHistorian(BaseHistorian):
             "registered_tables": list(result.registered),
             "rejected_tables": dict(result.rejected),
             "message": result.message,
-            "schema_version": HistorianStore.schema_version,
+            "application": result.application,
+            "schema_version": result.schema_version,
         }
 
     @staticmethod
     def _error_reply(message):
         return {"status": "error", "registered_tables": [], "rejected_tables": {}, "message": message,
-                "schema_version": HistorianStore.schema_version}
+                "application": None, "schema_version": None}
 
     # ---------------------------------------------------------------- standard query contract
     def query_topic_list(self):

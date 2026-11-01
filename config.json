@@ -18,5 +18,6 @@
         "data_table": "data",
         "topics_table": "topics"
     },
-    "table_definitions": []
+    "table_definitions": [],
+    "enumerations": []
 }
