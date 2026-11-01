@@ -9,6 +9,7 @@ from sqlalchemy.exc import OperationalError
 
 from conftest import NODE_DEFINITIONS, TABLE_NAMES, envelope_record, standard_record
 from historian.transactivate_node.store import KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
+from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
 from tent.enumerations import MarketTypes
 
 MARKET_ID = "0190a3c0-0000-7000-8000-000000000001"
@@ -71,7 +72,57 @@ class TestValidateConnection:
 def test_setup_creates_the_historians_own_tables(connection, db_url):
     open_store(connection)
     present = set(inspect(create_engine(db_url)).get_table_names())
-    assert {"topics", "data", KNOWN_TABLE_DEFINITIONS} <= present
+    assert {"topics", "data", KNOWN_TABLE_DEFINITIONS, ARCHIVE_SCHEMA_TABLE} <= present
+
+
+# ---------------------------------------------------------------- archive schema version
+def test_new_database_records_the_archive_schema_version(connection, db_url):
+    store = open_store(connection)
+    assert store.schema_version == ARCHIVE_SCHEMA_VERSION
+    [row] = store.data_manager.query_data(ARCHIVE_SCHEMA_TABLE)
+    assert row["version"] == ARCHIVE_SCHEMA_VERSION and row["fingerprint"] and row["tent_version"]
+    open_store(connection, NODE_DEFINITIONS)  # restart, same version: accepted, still one row
+    assert len(open_store(connection).data_manager.query_data(ARCHIVE_SCHEMA_TABLE)) == 1
+
+
+def test_database_of_another_schema_version_is_refused_at_setup(connection, db_url):
+    open_store(connection, NODE_DEFINITIONS)
+    with create_engine(db_url).begin() as conn:
+        conn.execute(text(f"UPDATE {ARCHIVE_SCHEMA_TABLE} SET version = {ARCHIVE_SCHEMA_VERSION + 5}"))
+    with pytest.raises(ArchiveSchemaMismatch) as error:
+        open_store(connection)
+    message = str(error.value)
+    assert f"version {ARCHIVE_SCHEMA_VERSION + 5}" in message and f"version {ARCHIVE_SCHEMA_VERSION}" in message
+    assert "Historian database" in message and "Recreate the database" in message
+    assert error.value.database_version == ARCHIVE_SCHEMA_VERSION + 5
+
+
+def test_database_without_the_archive_schema_table_is_version_one_and_refused(connection, db_url):
+    """A historian database from before 2 November 2026 has the historian's tables but no archive_schema."""
+    open_store(connection, NODE_DEFINITIONS)
+    with create_engine(db_url).begin() as conn:
+        conn.execute(text(f"DROP TABLE {ARCHIVE_SCHEMA_TABLE}"))
+    with pytest.raises(ArchiveSchemaMismatch, match=f"version 1;.*version {ARCHIVE_SCHEMA_VERSION}"):
+        open_store(connection)
+
+
+def test_archive_schema_is_a_reserved_table(connection):
+    store = open_store(connection)
+    result = store.register_definitions([{"name": ARCHIVE_SCHEMA_TABLE,
+                                          "columns": [{"name": "version", "type": "Integer",
+                                                       "kwargs": {"primary_key": True}}]}])
+    assert result.status == "error" and "reserved" in result.rejected[ARCHIVE_SCHEMA_TABLE]["message"]
+
+
+def test_node_schema_version_problem_names_both_versions():
+    assert HistorianStore.node_schema_version_problem(ARCHIVE_SCHEMA_VERSION) is None
+    problem = HistorianStore.node_schema_version_problem(ARCHIVE_SCHEMA_VERSION + 1)
+    assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in problem and f"version {ARCHIVE_SCHEMA_VERSION}" in problem
+    assert "Nothing was registered" in problem
+    missing = HistorianStore.node_schema_version_problem(None)
+    assert "does not state" in missing and "version 1" in missing and f"version {ARCHIVE_SCHEMA_VERSION}" in missing
+    assert HistorianStore.node_schema_version_problem(str(ARCHIVE_SCHEMA_VERSION)) is not None
+    assert HistorianStore.node_schema_version_problem(True) is not None
 
 
 def test_register_persists_definitions_and_creates_tables(connection, db_url):

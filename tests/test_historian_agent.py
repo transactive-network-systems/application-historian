@@ -7,9 +7,10 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
-from conftest import NODE_DEFINITIONS, envelope_record, standard_record
+from conftest import NODE_DEFINITIONS, envelope_record, registration, standard_record
+from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
 from historian.transactivate_node import transactive_node
 from historian.transactivate_node.store import KNOWN_TABLE_DEFINITIONS
 from historian.transactivate_node.transactive_node import (DEFAULT_VIP_IDENTITY, TransactiveNodeHistorian,
@@ -100,6 +101,37 @@ def test_setup_and_publish_before_configure_fail_loudly():
     assert agent.handled_all == 0
 
 
+def test_new_database_gets_the_archive_schema_row_at_setup(connection, db_url):
+    agent = running_historian(connection)
+    assert ARCHIVE_SCHEMA_TABLE in inspect(create_engine(db_url)).get_table_names()
+    assert agent.store.data_manager.schema_version == ARCHIVE_SCHEMA_VERSION
+    agent.historian_setup()  # a restart on the same database
+    assert agent.store.data_manager.schema_version == ARCHIVE_SCHEMA_VERSION
+
+
+def test_setup_refuses_a_database_of_another_schema_version(connection, db_url):
+    running_historian(connection)
+    with create_engine(db_url).begin() as conn:
+        conn.execute(text(f"UPDATE {ARCHIVE_SCHEMA_TABLE} SET version = 1"))
+    agent = TransactiveNodeHistorian()
+    agent.configure({"connection": connection})
+    with pytest.raises(ArchiveSchemaMismatch) as error:
+        agent.historian_setup()
+    message = str(error.value)
+    assert "Historian database" in message and "version 1" in message and f"version {ARCHIVE_SCHEMA_VERSION}" in message
+    assert not agent.store.ready
+
+
+def test_setup_refuses_a_database_from_before_the_version_was_recorded(connection, db_url):
+    running_historian(connection)
+    with create_engine(db_url).begin() as conn:
+        conn.execute(text(f"DROP TABLE {ARCHIVE_SCHEMA_TABLE}"))
+    agent = TransactiveNodeHistorian()
+    agent.configure({"connection": connection})
+    with pytest.raises(ArchiveSchemaMismatch, match=f"version 1;.*version {ARCHIVE_SCHEMA_VERSION}"):
+        agent.historian_setup()
+
+
 def test_configured_table_definitions_are_created_at_setup(connection, db_url):
     agent = running_historian(connection, table_definitions=NODE_DEFINITIONS)
     assert {"component", "market", "time_interval"} <= set(inspect(create_engine(db_url)).get_table_names())
@@ -113,53 +145,82 @@ def test_create_tables_is_exported_as_an_rpc():
 
 def test_create_tables_registers_persists_and_reports(connection, db_url):
     agent = running_historian(connection)
-    reply = agent.create_tables(NODE_DEFINITIONS)
+    reply = agent.create_tables(registration())
     assert reply["status"] == "success"
     assert reply["registered_tables"] == ["component", "market", "time_interval"]
     assert reply["rejected_tables"] == {}
     assert "3 table(s) created" in reply["message"]
-    assert set(reply) == {"status", "registered_tables", "rejected_tables", "message"}
+    assert set(reply) == {"status", "registered_tables", "rejected_tables", "message", "schema_version"}
     assert KNOWN_TABLE_DEFINITIONS in inspect(create_engine(db_url)).get_table_names()
-    again = agent.create_tables(NODE_DEFINITIONS)  # a second node registering the same schema
+    again = agent.create_tables(registration())  # a second node registering the same schema
     assert again["status"] == "success" and again["registered_tables"] == ["component", "market", "time_interval"]
     assert "identical" in again["message"]
 
 
 def test_create_tables_accepts_the_mapping_form(connection):
     agent = running_historian(connection)
-    reply = agent.create_tables({d["name"]: d for d in NODE_DEFINITIONS})
+    reply = agent.create_tables(registration({d["name"]: d for d in NODE_DEFINITIONS}))
     assert reply["status"] == "success"
+
+
+def test_create_tables_without_a_schema_version_is_refused_and_registers_nothing(connection):
+    """A bare list or mapping of definitions is what a node of TENT before 2 November 2026 sends."""
+    agent = running_historian(connection)
+    for payload in (NODE_DEFINITIONS, {d["name"]: d for d in NODE_DEFINITIONS}, {"definitions": NODE_DEFINITIONS}):
+        reply = agent.create_tables(payload)
+        assert reply["status"] == "error" and reply["registered_tables"] == [] and reply["rejected_tables"] == {}
+        assert "does not state its archive schema version" in reply["message"]
+        assert "version 1" in reply["message"] and f"version {ARCHIVE_SCHEMA_VERSION}" in reply["message"]
+        assert reply["schema_version"] == ARCHIVE_SCHEMA_VERSION
+    assert agent.store.registered_tables == set()
+
+
+def test_create_tables_with_another_schema_version_is_refused_naming_both(connection):
+    agent = running_historian(connection)
+    reply = agent.create_tables(registration(schema_version=ARCHIVE_SCHEMA_VERSION + 1))
+    assert reply["status"] == "error" and reply["registered_tables"] == []
+    assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in reply["message"]
+    assert f"version {ARCHIVE_SCHEMA_VERSION}" in reply["message"]
+    assert agent.store.registered_tables == set()
+    reply = agent.create_tables(registration(schema_version=str(ARCHIVE_SCHEMA_VERSION)))  # a string is not a version
+    assert reply["status"] == "error" and agent.store.registered_tables == set()
+
+
+def test_replies_carry_the_historians_schema_version(connection):
+    agent = running_historian(connection)
+    assert agent.create_tables(registration())["schema_version"] == ARCHIVE_SCHEMA_VERSION
+    assert agent.create_tables("not json")["schema_version"] == ARCHIVE_SCHEMA_VERSION
 
 
 def test_create_tables_reports_a_changed_definition_and_registers_the_rest(connection):
     agent = running_historian(connection)
-    agent.create_tables(NODE_DEFINITIONS)
+    agent.create_tables(registration())
     changed = dict(NODE_DEFINITIONS[2], columns=NODE_DEFINITIONS[2]["columns"][:-1] + [{"name": "duration",
                                                                                          "type": "Float"}])
-    reply = agent.create_tables([NODE_DEFINITIONS[1], changed])
+    reply = agent.create_tables(registration([NODE_DEFINITIONS[1], changed]))
     assert reply["status"] == "partial"
     assert reply["registered_tables"] == ["market"]
     assert set(reply["rejected_tables"]) == {"time_interval"}
     assert '+   "type": "Float"' in reply["rejected_tables"]["time_interval"]["differences"]
     assert "time_interval" in reply["message"]
-    alone = agent.create_tables([changed])
+    alone = agent.create_tables(registration([changed]))
     assert alone["status"] == "error" and alone["registered_tables"] == []
 
 
 def test_create_tables_with_reordered_columns_is_a_success(connection):
     agent = running_historian(connection)
-    agent.create_tables(NODE_DEFINITIONS)
+    agent.create_tables(registration())
     reordered = [dict(d, columns=list(reversed(d["columns"]))) for d in NODE_DEFINITIONS]
-    reply = agent.create_tables(reordered)
+    reply = agent.create_tables(registration(reordered))
     assert reply["status"] == "success" and reply["rejected_tables"] == {}
 
 
 def test_create_tables_rejects_disallowed_definitions(connection):
     agent = running_historian(connection)
-    reply = agent.create_tables([{"name": "evil", "columns": [{"name": "x", "type": "Integer"}],
-                                  "kwargs": {"quote": False}}])
+    reply = agent.create_tables(registration([{"name": "evil", "columns": [{"name": "x", "type": "Integer"}],
+                                               "kwargs": {"quote": False}}]))
     assert reply["status"] == "error" and "unsupported definition key" in reply["rejected_tables"]["evil"]["message"]
-    reply = agent.create_tables([{"name": "topics", "columns": [{"name": "x", "type": "Integer"}]}])
+    reply = agent.create_tables(registration([{"name": "topics", "columns": [{"name": "x", "type": "Integer"}]}]))
     assert reply["status"] == "error" and "reserved" in reply["rejected_tables"]["topics"]["message"]
     reply = agent.create_tables("not json")
     assert reply["status"] == "error" and reply["rejected_tables"] == {}
@@ -168,15 +229,15 @@ def test_create_tables_rejects_disallowed_definitions(connection):
 
 def test_create_tables_before_the_database_is_open_is_an_error_reply(connection):
     agent = TransactiveNodeHistorian()
-    assert agent.create_tables(NODE_DEFINITIONS)["status"] == "error"
+    assert agent.create_tables(registration())["status"] == "error"
     agent.configure({"connection": connection})
-    assert agent.create_tables(NODE_DEFINITIONS)["status"] == "error"
+    assert agent.create_tables(registration())["status"] == "error"
 
 
 # ---------------------------------------------------------------- publishing (H-02, H-INC-01)
 def test_envelopes_are_stored_and_the_batch_is_acknowledged(connection):
     agent = running_historian(connection)
-    agent.create_tables(NODE_DEFINITIONS)
+    agent.create_tables(registration())
     agent.publish_to_historian([envelope_record([market_envelope()])])
     assert agent.handled_all == 1
     rows = agent.store.data_manager.query_data("market")
@@ -215,7 +276,7 @@ def test_unknown_table_is_dropped_and_the_batch_is_still_acknowledged(connection
 
 def test_restart_keeps_tables_registered(connection):
     first = running_historian(connection)
-    first.create_tables(NODE_DEFINITIONS)
+    first.create_tables(registration())
     first.publish_to_historian([envelope_record([market_envelope()])])
 
     restarted = running_historian(connection)  # a new process: no create_tables call from the still-running node
@@ -242,7 +303,7 @@ def test_device_record_path_end_to_end(connection):
 
 def test_mixed_batch_routes_by_payload_shape(connection):
     agent = running_historian(connection)
-    agent.create_tables(NODE_DEFINITIONS)
+    agent.create_tables(registration())
     agent.publish_to_historian([
         standard_record(topic="tns/other", value={"not": "an envelope"}, record_id=1),
         envelope_record([market_envelope()], record_id=2),
@@ -253,9 +314,12 @@ def test_mixed_batch_routes_by_payload_shape(connection):
 
 
 # ---------------------------------------------------------------- pubsub registration path
-def definitions_message(definitions=NODE_DEFINITIONS, node="campus", request_id="req-1"):
-    return standard_record(topic=f"tns/archive/{node}/definitions",
-                           value={"node": node, "request_id": request_id, "definitions": definitions})
+def definitions_message(definitions=NODE_DEFINITIONS, node="campus", request_id="req-1",
+                        schema_version=ARCHIVE_SCHEMA_VERSION):
+    value = {"node": node, "request_id": request_id, "definitions": definitions}
+    if schema_version is not None:
+        value["schema_version"] = schema_version
+    return standard_record(topic=f"tns/archive/{node}/definitions", value=value)
 
 
 def test_definitions_message_registers_and_publishes_success(connection):
@@ -268,7 +332,7 @@ def test_definitions_message_registers_and_publishes_success(connection):
     assert headers["Date"] and headers["TimeStamp"]
     assert message == {"request_id": "req-1", "node": "campus", "status": "success",
                        "registered_tables": ["component", "market", "time_interval"], "rejected_tables": {},
-                       "message": message["message"]}
+                       "message": message["message"], "schema_version": ARCHIVE_SCHEMA_VERSION}
     agent.publish_to_historian([definitions_message(request_id="req-2")])  # idempotent
     assert agent.vip.pubsub.published[-1][2]["status"] == "success"
     assert agent.vip.pubsub.published[-1][2]["request_id"] == "req-2"
@@ -295,6 +359,23 @@ def test_definitions_message_partial_and_error_status(connection):
     status = agent.vip.pubsub.published[-1][2]
     assert status["status"] == "error" and status["registered_tables"] == []
     assert set(status["rejected_tables"]) == {"time_interval"}
+
+
+def test_definitions_message_of_another_schema_version_gets_an_error_status_and_registers_nothing(connection):
+    agent = running_historian(connection)
+    agent.publish_to_historian([definitions_message(request_id="req-v", schema_version=ARCHIVE_SCHEMA_VERSION + 1)])
+    [(topic, _, status)] = agent.vip.pubsub.published
+    assert topic == "tns/archive/campus/status" and status["request_id"] == "req-v"
+    assert status["status"] == "error" and status["registered_tables"] == []
+    assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in status["message"]
+    assert f"version {ARCHIVE_SCHEMA_VERSION}" in status["message"]
+    assert status["schema_version"] == ARCHIVE_SCHEMA_VERSION
+    assert agent.store.registered_tables == set()
+
+    agent.publish_to_historian([definitions_message(request_id="req-n", schema_version=None)])
+    status = agent.vip.pubsub.published[-1][2]
+    assert status["status"] == "error" and "does not state its archive schema version" in status["message"]
+    assert agent.store.registered_tables == set()
 
 
 def test_malformed_definitions_message_gets_an_error_status_only_with_a_request_id(connection, caplog):
@@ -340,7 +421,7 @@ def test_records_topic_with_a_different_prefix_is_still_routed(connection):
     agent = running_historian(connection)
     agent.publish_to_historian([standard_record(topic="other/prefix/archive/city/definitions",
                                                 value={"node": "city", "request_id": "r", "definitions":
-                                                       NODE_DEFINITIONS}),
+                                                       NODE_DEFINITIONS, "schema_version": ARCHIVE_SCHEMA_VERSION}),
                                 envelope_record([market_envelope()], topic="other/prefix/archive/city/records",
                                                 record_id=2)])
     assert agent.vip.pubsub.published[0][0] == "other/prefix/archive/city/status"

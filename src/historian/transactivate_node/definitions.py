@@ -57,6 +57,20 @@ def parse_definitions(definitions) -> list[dict]:
     return [dict(d) if isinstance(d, Mapping) else d for d in definitions]
 
 
+def parse_registration(payload) -> tuple[list[dict], object]:
+    """
+    Split a registration payload into (definitions, schema_version). A node sends
+    {"definitions": [...], "schema_version": N}, N being its TENT's tent.data_manager.ARCHIVE_SCHEMA_VERSION; the
+    definitions themselves may take any form parse_definitions accepts. schema_version is None when the payload is a
+    bare list, a {name: definition} mapping or a wrapper without the key: a node whose TENT predates the version
+    (2 November 2026, archive schema version 1). The caller decides what to do with it; this only reads the message.
+    """
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    schema_version = payload.get('schema_version') if isinstance(payload, Mapping) and 'definitions' in payload else None
+    return parse_definitions(payload), schema_version
+
+
 def canonical_form(definition: Mapping) -> dict:
     """The definition with its columns sorted by name (key order is handled by sort_keys when serialising)."""
     canonical = dict(definition)

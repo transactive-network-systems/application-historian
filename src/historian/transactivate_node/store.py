@@ -7,6 +7,11 @@ Database side of the transactive-node historian, kept free of VOLTTRON so it can
 - `known_table_definitions`: one row per registered archive table (name, canonical definition JSON, time registered).
   Definitions arrive over the `create_tables` RPC from each node's VolttronDataManager; persisting them beside the data
   is what lets the historian restart without the nodes re-registering, and is what the mismatch check compares against;
+- `archive_schema`: TENT's one-row record of the archive schema version the database was written with
+  (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`), written by the data manager when the database is new and checked on
+  every start-up: a database of another version is refused (`ArchiveSchemaMismatch`, both versions in the message),
+  nothing is migrated. A node's registration states its own schema version and is refused when it differs from the
+  historian's TENT (`node_schema_version_problem`);
 - the archive tables themselves, created from those definitions.
 
 On start-up (`setup`) the stored definitions are reloaded, any table in the database that has no stored definition is
@@ -25,6 +30,7 @@ from fnmatch import fnmatchcase
 
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
+from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
 from tent.data_manager.local_data_manager import LocalDataManager
 
 from historian.transactivate_node.definitions import (canonical_json, check_definitions, describe_difference,
@@ -89,7 +95,7 @@ class HistorianStore:
         self.url: str = self.validate_connection(connection)
         self.topics_table: str = table_names['topics_table']
         self.data_table: str = table_names['data_table']
-        self.own_tables: set[str] = {self.topics_table, self.data_table, KNOWN_TABLE_DEFINITIONS}
+        self.own_tables: set[str] = {self.topics_table, self.data_table, KNOWN_TABLE_DEFINITIONS, ARCHIVE_SCHEMA_TABLE}
         self.data_manager: LocalDataManager | None = None
         self.reflected_tables: set[str] = set()
         self.topic_id_map: dict[str, int] = {}
@@ -135,6 +141,27 @@ class HistorianStore:
     @property
     def ready(self) -> bool:
         return self.data_manager is not None
+
+    # ---------------------------------------------------------------- archive schema version
+    schema_version: int = ARCHIVE_SCHEMA_VERSION
+    """The archive schema version this historian's TENT writes; the database is checked to be of it at set-up."""
+
+    @staticmethod
+    def node_schema_version_problem(schema_version) -> str | None:
+        """
+        None when a registration's declared archive schema version is this historian's; otherwise the reason it is
+        refused, naming both versions. A registration that states no version comes from a TENT before 2 November 2026
+        (archive schema version 1) and is refused the same way; nothing is migrated or translated.
+        """
+        if schema_version == ARCHIVE_SCHEMA_VERSION and isinstance(schema_version, int):
+            return None
+        if schema_version is None:
+            described = 'does not state its archive schema version, so its TENT writes archive schema version 1'
+        else:
+            described = f'states archive schema version {schema_version!r}'
+        return (f'The node {described}; this historian\'s TENT writes archive schema version {ARCHIVE_SCHEMA_VERSION}. '
+                f'Nothing was registered. Run the node and the historian on TENT installations with the same archive '
+                f'schema version.')
 
     @property
     def writable_tables(self) -> set[str]:
@@ -194,7 +221,13 @@ class HistorianStore:
     def _build_data_manager(self) -> None:
         data_manager = LocalDataManager(None, {'url': self.url})
         data_manager.add_tables(self._own_table_definitions())
-        data_manager.init_archive()  # creates the historian's own tables when missing
+        try:
+            # Creates the historian's own tables when missing; writes the archive_schema row into a new database and
+            # refuses a database written with another archive schema version.
+            data_manager.init_archive()
+        except ArchiveSchemaMismatch as error:
+            raise ArchiveSchemaMismatch(error.database_version, error.tent_schema_version,
+                                        where=f'Historian database {self.redacted_url!r}') from error
         stored = self._stored_definitions(data_manager)
         if stored:
             data_manager.add_tables(list(stored.values()))

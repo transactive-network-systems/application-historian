@@ -11,7 +11,9 @@ It serves two kinds of record through one BaseHistorian subscription set:
   VolttronDataManager publishes on `<db_topic>/archive/<node>/records` after registering its table definitions,
   either with the `create_tables` RPC (default) or by publishing them on `<db_topic>/archive/<node>/definitions`;
   the historian answers the pubsub path on `<db_topic>/archive/<node>/status`. Envelopes are stored in the
-  registered archive tables.
+  registered archive tables. A registration states the node's archive schema version
+  (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`) beside its definitions and is refused when it is not the version this
+  historian's TENT writes; the database itself is refused at start-up when it was written with another version.
 
 Topics under `<db_topic>/archive/` are routed by their last segment (records, definitions, status); every other
 captured topic is a standard record, except that an archive envelope is recognised by shape wherever it arrives. All
@@ -37,7 +39,7 @@ from volttron.client.messaging import headers as headers_mod
 from volttron.client.vip.agent import RPC
 from volttron.utils import load_config, vip_main
 
-from historian.transactivate_node.definitions import parse_definitions
+from historian.transactivate_node.definitions import parse_definitions, parse_registration
 from historian.transactivate_node.store import HistorianStore, RegistrationResult
 
 __version__ = "3.0.0"
@@ -110,7 +112,9 @@ class TransactiveNodeHistorian(BaseHistorian):
         _log.info(f"Historian database: {self.store.redacted_url}")
 
     def historian_setup(self):
-        """Open the database, create the historian's tables and reload the registered table definitions."""
+        """Open the database, create the historian's tables and reload the registered table definitions. A database
+        written with another archive schema version raises ArchiveSchemaMismatch (both versions in the message); the
+        historian then does not start, and the operator recreates the database or runs the matching TENT."""
         if self.store is None:
             raise RuntimeError(f'The historian is not configured (see the configuration error logged above). '
                                f'{CONFIGURATION_HELP}')
@@ -163,9 +167,9 @@ class TransactiveNodeHistorian(BaseHistorian):
     # ---------------------------------------------------------------- pubsub registration path
     def _handle_definitions_message(self, prefix, node, message):
         """
-        Register the definitions in a `{"node", "request_id", "definitions"}` message and publish the outcome on
-        `<prefix>/archive/<node>/status`. A malformed message is logged; it gets an "error" status reply only when it
-        carries a request_id to answer.
+        Register the definitions in a `{"node", "request_id", "definitions", "schema_version"}` message and publish the
+        outcome on `<prefix>/archive/<node>/status`. A malformed message is logged; it gets an "error" status reply
+        only when it carries a request_id to answer.
         """
         request_id = message.get("request_id") if isinstance(message, Mapping) else None
         if not isinstance(request_id, str) or not request_id:
@@ -184,7 +188,7 @@ class TransactiveNodeHistorian(BaseHistorian):
         if request_id is None:
             _log.error(f'Definitions message from node {node!r} has no request_id; the node cannot match a reply. '
                        f'The definitions are registered anyway.')
-        reply = self._register(message["definitions"])
+        reply = self._register({"definitions": message["definitions"], "schema_version": message.get("schema_version")})
         if request_id is not None:
             self._publish_status(prefix, node, request_id, reply)
 
@@ -205,15 +209,19 @@ class TransactiveNodeHistorian(BaseHistorian):
     def create_tables(self, definitions):
         """
         Register archive table definitions (the structure TENT's `get_archive_definitions` returns) and create the
-        tables. Each definition is checked against an allow-list of keys, column types and column keywords, persisted
-        in `known_table_definitions`, and compared with the stored definition when its table is registered again
-        (column order does not matter). Tables are handled one by one: the unchanged ones are registered even when
-        another in the same call is rejected.
+        tables. The argument is `{"definitions": [...], "schema_version": N}`: the node's definitions and its TENT's
+        `tent.data_manager.ARCHIVE_SCHEMA_VERSION`. A registration whose schema version is not the one this
+        historian's TENT writes, or that states none (a TENT before 2 November 2026), is refused with "error" naming
+        both versions and nothing is registered. Each definition is then checked against an allow-list of keys, column
+        types and column keywords, persisted in `known_table_definitions`, and compared with the stored definition
+        when its table is registered again (column order does not matter). Tables are handled one by one: the
+        unchanged ones are registered even when another in the same call is rejected.
 
         Returns {"status": "success" | "partial" | "error", "registered_tables": [accepted names],
-        "rejected_tables": {name: {"message": str, "differences": unified diff or None}}, "message": str}; "success"
-        means every table is registered (created now or already known and identical), "partial" that at least one
-        was and at least one was rejected, "error" that none was.
+        "rejected_tables": {name: {"message": str, "differences": unified diff or None}}, "message": str,
+        "schema_version": the historian's archive schema version}; "success" means every table is registered (created
+        now or already known and identical), "partial" that at least one was and at least one was rejected, "error"
+        that none was.
 
         This RPC runs DDL; the modular platform has no `RPC.allow` decorator, so protect it per deployment:
         `vctl authz add agent <historian identity> --protected-rpcs create_tables` and give each node
@@ -223,12 +231,18 @@ class TransactiveNodeHistorian(BaseHistorian):
             return self._error_reply(f"The historian database is not open. {CONFIGURATION_HELP}")
         return self._register(definitions)
 
-    def _register(self, definitions):
+    def _register(self, payload):
         try:
-            result = self.store.register_definitions(parse_definitions(definitions))
+            definitions, schema_version = parse_registration(payload)
         except ValueError as exc:  # unparsable request (not JSON, not a list or mapping)
             _log.error(f"Table registration rejected: {exc}")
             return self._error_reply(str(exc))
+        problem = self.store.node_schema_version_problem(schema_version)
+        if problem is not None:
+            _log.error(f"Table registration refused: {problem}")
+            return self._error_reply(problem)
+        try:
+            result = self.store.register_definitions(definitions)
         except Exception as exc:  # the database itself failed; nothing was registered
             _log.exception("Table registration failed")
             return self._error_reply(f"Registration failed: {exc!r}")
@@ -241,11 +255,13 @@ class TransactiveNodeHistorian(BaseHistorian):
             "registered_tables": list(result.registered),
             "rejected_tables": dict(result.rejected),
             "message": result.message,
+            "schema_version": HistorianStore.schema_version,
         }
 
     @staticmethod
     def _error_reply(message):
-        return {"status": "error", "registered_tables": [], "rejected_tables": {}, "message": message}
+        return {"status": "error", "registered_tables": [], "rejected_tables": {}, "message": message,
+                "schema_version": HistorianStore.schema_version}
 
     # ---------------------------------------------------------------- standard query contract
     def query_topic_list(self):

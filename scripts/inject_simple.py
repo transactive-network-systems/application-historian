@@ -28,6 +28,7 @@ import pytz
 from volttron.client.vip.agent import Agent
 from volttron.client.messaging import headers as headers_mod
 from volttron.utils import format_timestamp
+from tent.data_manager import ARCHIVE_SCHEMA_VERSION
 
 
 def main():
@@ -85,7 +86,7 @@ def main():
             result = agent.vip.rpc.call(
                 HISTORIAN_VIP,
                 "create_tables",
-                [table_definition]
+                {"definitions": [table_definition], "schema_version": ARCHIVE_SCHEMA_VERSION}
             ).get(timeout=5)
             print(f"[OK] Registration result: {result}")
         except Exception as e:

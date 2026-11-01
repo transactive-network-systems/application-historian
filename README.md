@@ -27,18 +27,22 @@ refused (TENT's archive convention is UTC-aware everywhere).
 Before publishing records, each node registers the table definitions its components declare
 (`get_archive_definitions()`). Two paths carry the same definitions and return the same outcome:
 
-- **RPC (default):** `create_tables(definitions)` on the historian's identity. It needs an RPC route to the historian,
-  which the modular platform only has within one platform.
-- **Pubsub (optional):** the node publishes `{"node": "<node>", "request_id": "<uuid>", "definitions": [...]}` on
-  `<db_topic>/archive/<node>/definitions`; the historian answers on `<db_topic>/archive/<node>/status` with the
-  outcome below plus `request_id` and `node`. The node subscribes to its status topic with `all_platforms=True`, so
+- **RPC (default):** `create_tables({"definitions": [...], "schema_version": N})` on the historian's identity. It
+  needs an RPC route to the historian, which the modular platform only has within one platform.
+- **Pubsub (optional):** the node publishes `{"node": "<node>", "request_id": "<uuid>", "definitions": [...],
+  "schema_version": N}` on `<db_topic>/archive/<node>/definitions`; the historian answers on
+  `<db_topic>/archive/<node>/status` with the outcome below plus `request_id` and `node`. The node subscribes to its status topic with `all_platforms=True`, so
   this works across federated platforms. The reply is an ordinary publish; cross-platform visibility comes from the
   subscriber side. A definitions message without `request_id` is registered but gets no reply; a malformed message is
   logged and answered with `"status": "error"` when it carries a `request_id`. The historian ignores its own status
   publications when they come back through its `<db_topic>/archive/` capture.
 
-Either way the historian:
+`schema_version` is the node's `tent.data_manager.ARCHIVE_SCHEMA_VERSION`, the version of the set of table
+definitions its TENT ships (see "Archive schema version" below). Either way the historian:
 
+0. **Checks the schema version.** A registration whose `schema_version` is not the one this historian's TENT writes,
+   or that has none (a bare list or mapping of definitions, which is what a node of TENT before 2 November 2026
+   sends), is answered with `"status": "error"` naming both versions, and nothing is registered.
 1. **Validates** each definition against an allow-list. Table keys: `name`, `columns`, `inherits`, `indices`,
    `constraints`. Column keys: `name`, `type`, `type_args`, `enumeration`, `foreign_key`, `identity`, `kwargs`,
    `nullable`. Column types: `BigInteger`, `Boolean`, `Date`, `DateTime`, `Float`, `Integer`, `Interval`, `JSON`,
@@ -46,20 +50,22 @@ Either way the historian:
    `nullable`, `unique`, `autoincrement`, `index`. Table-level `kwargs` (`quote`, `prefixes`, `schema`, ...) are not
    accepted; names must be plain identifiers; `enumeration` must name an enum in `tent.enumerations`; `inherits` and
    foreign-key targets must be in the same registration or already in the database. The historian's own tables
-   (`topics`, `data`, `known_table_definitions`) cannot be redefined.
+   (`topics`, `data`, `known_table_definitions`, `archive_schema`) cannot be redefined.
 2. **Compares** a table that is already registered with the stored definition. Key order and **column order do not
    matter**; a changed, added or removed column does. An identical definition is accepted without change.
 3. **Creates** the accepted new tables (columns in the order given) and **persists** each definition in the
    `known_table_definitions` table (`name`, `definition` JSON, `registered_time`) in the same database as the data.
 
 Tables are handled one by one. The outcome is
-`{"status": ..., "registered_tables": [...], "rejected_tables": {name: {"message": ..., "differences": ...}}, "message": ...}`:
+`{"status": ..., "registered_tables": [...], "rejected_tables": {name: {"message": ..., "differences": ...}}, "message": ..., "schema_version": N}`:
 
 - `success`: every table is registered (created now, or already known and identical);
 - `partial`: at least one table registered and at least one rejected;
-- `error`: nothing registered (malformed request, every table rejected, or a database failure).
+- `error`: nothing registered (schema version refused, malformed request, every table rejected, or a database
+  failure).
 
-`registered_tables` lists every accepted table, including those already known. `differences` is a unified diff of the
+`schema_version` is the historian's archive schema version, in every reply. `registered_tables` lists every accepted
+table, including those already known. `differences` is a unified diff of the
 stored and offered definitions for a mismatch, otherwise `null`. A table that refers to a table rejected in the same
 registration (through `inherits` or a foreign key) is rejected with it. The archive keeps the definition a table was
 created with; a changed schema needs a new table name or a new database.
@@ -71,6 +77,19 @@ an `Interval` reflects as DATETIME, an `Enum` as VARCHAR, a `Uuid` as CHAR(32)),
 definition for a reflected table replaces the reflection. An envelope naming a table that is neither registered nor
 present is dropped and logged at error level with a count; it does not block the rest of the batch. A message on a
 `records` topic that is not an envelope or a list of envelopes is dropped and logged.
+
+### Archive schema version
+
+TENT numbers the set of table definitions it ships: `tent.data_manager.ARCHIVE_SCHEMA_VERSION`, incremented whenever
+one of them changes (version 1 is every archive written before 2 November 2026, which carries no version). The
+historian's database records the version it was written with in TENT's `archive_schema` table (`version`,
+`fingerprint`, `tent_version`, `created`): the data manager writes the row when the database is new and checks it at
+every start-up. A database written with another version, or one that has tables but no `archive_schema` table
+(version 1), makes `historian_setup` raise `ArchiveSchemaMismatch` with both versions in the message, and the historian
+does not start; nothing is migrated. The remedy is a new database (a new URL, or delete the file) or a historian whose
+TENT is of the database's version. A node's registration is refused the same way when its version differs from the
+historian's, so "this database is from an older TENT" and "this node runs another TENT than the historian" are each
+said in so many words instead of appearing as rejected table definitions.
 
 ### Protecting `create_tables`
 
@@ -172,8 +191,10 @@ pixi run test          # or: python -m pytest
 
 The tests need `tent`, SQLAlchemy and pytest but no VOLTTRON platform: the store is tested against a SQLite file in a
 temporary directory, and the agent module is imported with the VOLTTRON modules replaced by `tests/volttron_stubs.py`.
-`scripts/inject_simple.py` is a manual check against a running platform (it registers a table over RPC and publishes a
-few envelopes on `tns/archive/<node>/records` and some standard records); it is not collected by pytest.
+`scripts/inject_simple.py` is a manual check against a running platform (it registers a table over RPC, with the
+installed TENT's `ARCHIVE_SCHEMA_VERSION`, and publishes a few envelopes on `tns/archive/<node>/records` and some
+standard records); it is not collected by pytest. The tests import `tent` from the environment; the archive schema
+version they check against is that TENT's.
 
 Layout: `src/historian/transactivate_node/definitions.py` (definition parsing, allow-list validation, canonical form
 and diff), `store.py` (`HistorianStore`: database handling, free of VOLTTRON), `transactive_node.py` (the agent).

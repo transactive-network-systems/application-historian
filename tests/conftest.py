@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from tent.data_manager import ARCHIVE_SCHEMA_VERSION
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -48,6 +49,11 @@ NODE_DEFINITIONS = [
 ]
 
 TABLE_NAMES = {"topics_table": "topics", "data_table": "data"}
+
+
+def registration(definitions=NODE_DEFINITIONS, schema_version=ARCHIVE_SCHEMA_VERSION):
+    """The create_tables argument a node sends: its definitions beside its TENT's archive schema version."""
+    return {"definitions": definitions, "schema_version": schema_version}
 
 
 @pytest.fixture
