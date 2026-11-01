@@ -1,5 +1,6 @@
 """HistorianStore against a SQLite file: configuration, registration, restart, envelope and standard-record writes, queries."""
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -427,6 +428,23 @@ def test_envelopes_with_json_string_values_are_normalised_by_column_type(connect
     assert interval["market_id"] == uuid.UUID(MARKET_ID)
     assert interval["start_time"] == datetime(2026, 6, 9, 13, tzinfo=timezone.utc)
     assert interval["duration"] == timedelta(seconds=3600)
+
+
+def test_non_finite_floats_arrive_as_tokens_and_are_stored_as_the_columns_infinity(connection):
+    """A publisher serialising with standard JSON sends {"$float": ...} for inf, -inf and NaN (archivable.encoding)."""
+    priced = {"name": "vertex", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}},
+                                            {"name": "price", "type": "Float"}, {"name": "cost", "type": "Float"}]}
+    store = open_store(connection, [priced])
+    result = store.write([envelope_record([
+        {"table_name": "vertex", "data": {"id": 1, "price": {"$float": "inf"}, "cost": 0.5}},
+        {"table_name": "vertex", "data": {"id": 2, "price": {"$float": "-inf"}, "cost": {"$float": "nan"}}},
+        {"table_name": "vertex", "data": {"id": 3, "price": 0.25, "cost": 1.0}},
+    ])])
+    assert result.archive_rows == 3 and result.dropped == 0
+    rows = {r["id"]: r for r in store.data_manager.query_data("vertex")}
+    assert rows[1]["price"] == math.inf and rows[1]["cost"] == 0.5
+    assert rows[2]["price"] == -math.inf and rows[2]["cost"] is None, "SQLite keeps NaN as NULL; PostgreSQL keeps NaN"
+    assert rows[3]["price"] == 0.25
 
 
 def test_single_envelope_value_is_accepted(connection):

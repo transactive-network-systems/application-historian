@@ -22,7 +22,9 @@ wherever it arrives.
 ```
 
 Envelope values are JSON forms (UUIDs and enumeration member names as strings, datetimes as ISO 8601 with an offset,
-durations as seconds); the data manager parses them back by column type. A naive datetime is
+durations as seconds, a non-finite float as `lib-archivable`'s `{"$float": "inf" | "-inf" | "nan"}` token); the data
+manager parses them back by column type, so an inelastic vertex's infinite price is stored as the Float column's
+infinity (SQLite has no NaN and keeps NULL for one). A naive datetime is
 refused (the archive convention is UTC-aware everywhere).
 
 Package `historian.application` (`src/historian/application/`): `agent.py` holds the agent class
