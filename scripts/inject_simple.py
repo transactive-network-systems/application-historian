@@ -1,46 +1,20 @@
 #!/usr/bin/env python
 """
-Simple test script to inject fake TNS data into VOLTTRON for testing the historian.
-Uses vctl auth add to create credentials first.
-# TODO make this more of an official test. 
-SETUP INSTRUCTIONS:
--------------------
-Before running this script, you need to:
-1. Have VOLTTRON running with the TN Historian agent installed
-2. Create credentials for the test agent:
-   pixi run vctl auth add --identity test.injector
+Manual check against a running platform: register a table with the transactive-node historian and publish a few
+archive envelopes and standard records. Not a pytest test (it needs VOLTTRON and a running historian).
 
-CUSTOMIZATION REQUIRED:
------------------------
-To use this script for your own system, modify the following:
+Before running:
+1. VOLTTRON is running with the historian installed and configured (see README.md). HISTORIAN_VIP below must be the
+   identity it was installed under (the containers use "tns.historian"; the agent's default is "platform.historian").
+2. Create credentials for this script's identity:  vctl auth add --identity test.injector
+3. If create_tables is protected (README, "Protecting create_tables"), give test.injector the capability
+   <historian identity>.create_tables.
 
-1. TABLE NAME (Line ~35, optional):
-   Change test_table_name = "test_transactive_records" to your desired table name.
+Run with VOLTTRON_HOME set, e.g.:  pixi run python scripts/inject_simple.py
 
-2. TABLE SCHEMA (Lines ~59-66):
-   Modify the table_columns list to match your data structure:
-   - Keep the "id" column with primary_key for SQLAlchemy requirements
-   - Add/remove/modify other columns as needed
-   - DO NOT include "id" in your test data payload
-
-4. TEST DATA (Lines ~91-97):
-   Update the "data" dictionary to match your schema and desired test values.
-
-4. TOPIC (Line ~87, optional):
-   Change topic = f"TNS/{test_table_name}" if your historian subscribes to a different pattern.
-
-5. AGENT IDENTITY (Line ~47, optional):
-   Change "test.injector" if you want a different identity name.
-
-USAGE:
-------
-Run with: pixi run python test_inject_simple.py
-
-The script will:
-- Connect to VOLTTRON via VIP
-- Register the table schema with the historian
-- Publish 4 test records
-- Display success/error messages
+The archive topic prefix must match the historian's custom_topics.capture_record_data entry (case-sensitive; "tns/"
+in this project's containers). Adjust the table name, columns and data below for your own schema; keep an "id"
+primary key column and do not include it in the data payload.
 """
 
 import json
@@ -71,6 +45,8 @@ def main():
     
     # Create test data
     test_table_name = "test_transactive_records"
+    HISTORIAN_VIP = "tns.historian"
+    ARCHIVE_PREFIX = "tns"
     
     print("=" * 60)
     print("TNS Historian Test Data Injection")
@@ -106,7 +82,7 @@ def main():
         
         try:
             result = agent.vip.rpc.call(
-                "tns.historian",
+                HISTORIAN_VIP,
                 "create_tables",
                 [table_definition]
             ).get(timeout=5)
@@ -116,8 +92,8 @@ def main():
             print("Records will remain retryable until the table is registered.")
         
         # Publish test records
-        print(f"\nPublishing test records to TNS/{test_table_name}...")
-        topic = f"TNS/{test_table_name}"
+        print(f"\nPublishing test records to {ARCHIVE_PREFIX}/{test_table_name}...")
+        topic = f"{ARCHIVE_PREFIX}/{test_table_name}"
         standard_topic = f"record/{test_table_name}"
         
         now = format_timestamp(datetime.utcnow())

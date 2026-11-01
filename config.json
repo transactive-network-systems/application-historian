@@ -1,19 +1,22 @@
 {
     "connection": {
-        "type": "sqlite",
         "params": {
             "url": "sqlite:///historian_data.sqlite"
         }
     },
+    "all_platforms": true,
+    "capture_device_data": true,
+    "capture_analysis_data": true,
+    "capture_log_data": true,
+    "capture_record_data": true,
     "custom_topics": {
         "capture_record_data": [
-            "TNS/"
+            "tns/"
         ]
     },
     "tables_def": {
         "data_table": "data",
         "topics_table": "topics"
     },
-    "table_definitions": [],
-    "all_platforms": true
+    "table_definitions": []
 }

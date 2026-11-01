@@ -21,23 +21,20 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering",
     "Topic :: Software Development :: Libraries :: Python Modules"
 ]
 
 [tool.poetry.dependencies]
-python = "^3.10"
-volttron-core = ">=0.1.0"
+python = "^3.11"
+volttron-core = ">=2.0.0rc0"
 volttron-lib-base-historian = { version = ">=2.0.0rc1", allow-prereleases = true }
-# Install the local TENT package with `vctl install-lib` before this agent.
+# tent (code/TENT in this project) is required and is installed into the platform with `vctl install-lib` or
+# `pip install -e ../TENT`; it is not on PyPI yet. It brings SQLAlchemy. See README.md.
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0.0"
-pytest-timeout = ">=2.0.0"
-mock = ">=4.0.0"
-pre-commit = ">=2.0.0"
 
 [tool.poetry.scripts]
 volttron-transactive-node-historian = "historian.transactivate_node.transactive_node:main"
@@ -48,7 +45,7 @@ line_length = 120
 
 [tool.black]
 line-length = 120
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
