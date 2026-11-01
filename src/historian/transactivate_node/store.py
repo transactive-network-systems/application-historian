@@ -27,8 +27,8 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from tent.data_manager.local_data_manager import LocalDataManager
 
-from historian.transactivate_node.definitions import (TableDefinitionMismatch, canonical_json, describe_difference,
-                                                      validate_definitions)
+from historian.transactivate_node.definitions import (canonical_json, check_definitions, describe_difference,
+                                                      reject_unresolved)
 
 _log = logging.getLogger(__name__)
 
@@ -42,6 +42,34 @@ def format_timestamp(value: datetime) -> str:
         offset = value.strftime('%z')
         text += f'{offset[:3]}:{offset[3:]}'
     return text
+
+
+@dataclass
+class RegistrationResult:
+    """Outcome of one registration call; the agent turns it into the create_tables reply / status message."""
+    registered: list[str] = field(default_factory=list)  # accepted tables: created now or already known and identical
+    created: list[str] = field(default_factory=list)  # the subset that was new in this call
+    rejected: dict[str, dict] = field(default_factory=dict)  # table -> {"message": str, "differences": str | None}
+
+    @property
+    def status(self) -> str:
+        if self.registered and not self.rejected:
+            return 'success'
+        if self.registered:
+            return 'partial'
+        return 'error'
+
+    @property
+    def message(self) -> str:
+        parts = []
+        if self.created:
+            parts.append(f'{len(self.created)} table(s) created: {sorted(self.created)}')
+        already = sorted(set(self.registered) - set(self.created))
+        if already:
+            parts.append(f'{len(already)} table(s) already registered with an identical definition: {already}')
+        if self.rejected:
+            parts.append(f'{len(self.rejected)} table(s) rejected: {sorted(self.rejected)}')
+        return '; '.join(parts) + '.' if parts else 'No table definitions were supplied.'
 
 
 @dataclass
@@ -128,7 +156,9 @@ class HistorianStore:
         with self._lock:
             self._build_data_manager()
             if configured_definitions:
-                self.register_definitions(configured_definitions)
+                result = self.register_definitions(configured_definitions)
+                if result.rejected:
+                    raise ValueError(f'Configured table_definitions rejected: {result.rejected}')
             self._load_topic_cache()
 
     def _own_table_definitions(self) -> list[dict]:
@@ -188,46 +218,78 @@ class HistorianStore:
         return {row['name']: json.loads(row['definition']) for row in rows}
 
     # ---------------------------------------------------------------- registration
-    def register_definitions(self, definitions: Sequence[Mapping]) -> list[str]:
+    def register_definitions(self, definitions: Sequence) -> RegistrationResult:
         """
-        Validate, compare with what is stored, persist what is new and create the tables. Returns the names registered
-        by this call (an identical re-registration registers nothing and is not an error). Raises ValueError for an
-        invalid definition and TableDefinitionMismatch when a stored definition differs from the offered one; in both
-        cases nothing is changed.
+        Check each definition, compare it with what is stored, persist and create the new ones. Tables are handled one
+        by one: a rejected table (invalid, or stored with a different definition) does not stop the others, and an
+        identical re-registration is accepted without change. Column order does not matter in the comparison; a new
+        table is created with its columns in the order given. Raises only when the database itself fails.
         """
         with self._lock:
             self._require_ready()
-            validate_definitions(definitions, reserved_names=self.own_tables, known_names=self.registered_tables)
+            result = RegistrationResult()
+            # Any table in the database other than the historian's own (registered or reflected) may be referred to.
+            present = set(self.data_manager.tables) - self.own_tables
+            valid, rejected = check_definitions(definitions, reserved_names=self.own_tables, known_names=present)
+            result.rejected.update({name: {'message': message, 'differences': None}
+                                    for name, message in rejected.items()})
             stored = self._stored_definitions(self.data_manager)
-            differences, new = {}, []
-            for definition in definitions:
+            new: list[dict] = []
+            for definition in valid:
                 name = definition['name']
-                if name in stored:
-                    if canonical_json(stored[name]) != canonical_json(definition):
-                        differences[name] = describe_difference(stored[name], definition)
+                if name not in stored:
+                    new.append(definition)
+                    result.registered.append(name)
+                elif canonical_json(stored[name]) == canonical_json(definition):
+                    result.registered.append(name)
                 else:
-                    new.append(dict(definition))
-            if differences:
-                raise TableDefinitionMismatch(differences)
+                    result.rejected[name] = {
+                        'message': f'Table {name!r} is already registered with a different definition. The archive '
+                                   f'keeps the definition a table was created with; use a new table name or a new '
+                                   f'database if the schema has changed.',
+                        'differences': describe_difference(stored[name], definition),
+                    }
+            # A table that refers to one just rejected for a mismatch cannot be created either. Any table in the
+            # database (registered, reflected or the historian's own) can be referred to.
+            reasons = {name: rejection['message'] for name, rejection in result.rejected.items()}
+            reject_unresolved(new, reasons, available=present | set(stored))
+            for name, message in reasons.items():
+                if name not in result.rejected:
+                    result.registered.remove(name)
+                    result.rejected[name] = {'message': message, 'differences': None}
+            for name, rejection in result.rejected.items():
+                _log.error(f'Table definition rejected: {rejection["message"]}')
             if not new:
-                return []
-            registered_time = datetime.now(timezone.utc)
-            for definition in new:
-                self.data_manager.upsert_data(KNOWN_TABLE_DEFINITIONS, {
-                    'name': definition['name'],
-                    'definition': canonical_json(definition),
-                    'registered_time': registered_time,
-                }, ['name'])
-            names = [definition['name'] for definition in new]
-            if any(name in self.reflected_tables for name in names):
-                # A reflected Table is already in the metadata under this name; rebuild so the definition wins.
+                return result
+            result.created = [definition['name'] for definition in new]
+            if any(name in self.reflected_tables for name in result.created):
+                # A reflected Table is already in the metadata under this name; persist, then rebuild so the
+                # definition wins over the reflection.
+                self._persist_definitions(new)
                 self._build_data_manager()
                 self._load_topic_cache()
             else:
-                self.data_manager.add_tables(new)
-                self.data_manager.init_archive()
-            _log.info(f'Registered archive table(s): {names}')
-            return names
+                try:
+                    self.data_manager.add_tables(new)
+                    self.data_manager.init_archive()
+                except Exception:
+                    # The metadata now holds Table objects that could not be created; rebuild from what is stored so
+                    # the data manager stays consistent, and let the caller report the failure.
+                    self._build_data_manager()
+                    self._load_topic_cache()
+                    raise
+                self._persist_definitions(new)
+            _log.info(f'Registered archive table(s): {result.created}')
+            return result
+
+    def _persist_definitions(self, definitions: Sequence[Mapping]) -> None:
+        registered_time = datetime.now(timezone.utc)
+        for definition in definitions:
+            self.data_manager.upsert_data(KNOWN_TABLE_DEFINITIONS, {
+                'name': definition['name'],
+                'definition': json.dumps(definition, sort_keys=True),  # columns in the order given: the DDL order
+                'registered_time': registered_time,
+            }, ['name'])
 
     def _require_ready(self) -> None:
         if self.data_manager is None:
@@ -278,6 +340,10 @@ class HistorianStore:
             self.data_manager.archival_queue.clear()
             raise
         result.archive_rows += len(rows)
+
+    @staticmethod
+    def is_envelope_payload(value) -> bool:
+        return HistorianStore._envelopes(value) is not None
 
     @staticmethod
     def _envelopes(value):

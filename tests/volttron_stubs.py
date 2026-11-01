@@ -9,6 +9,29 @@ import types
 from copy import deepcopy
 
 
+class _Result:
+
+    def get(self, timeout=None):
+        return None
+
+
+class _PubSub:
+    """Records publish calls as (topic, headers, message)."""
+
+    def __init__(self):
+        self.published = []
+
+    def publish(self, peer, topic, headers=None, message=None, bus="", **kwargs):
+        self.published.append((topic, headers, message))
+        return _Result()
+
+
+class _Vip:
+
+    def __init__(self):
+        self.pubsub = _PubSub()
+
+
 class BaseHistorian:
 
     def __init__(self, **kwargs):
@@ -16,6 +39,7 @@ class BaseHistorian:
         self._default_config = {}
         self.handled_all = 0
         self.handled_records = []
+        self.vip = _Vip()
 
     def update_default_config(self, config):
         self._default_config.update(config)
@@ -78,6 +102,8 @@ def install():
         "volttron.client": {},
         "volttron.client.known_identities": {"PLATFORM_HISTORIAN": "platform.historian"},
         "volttron.client.logs": {"setup_logging": lambda *a, **k: None},
+        "volttron.client.messaging": {},
+        "volttron.client.messaging.headers": {"DATE": "Date", "TIMESTAMP": "TimeStamp"},
         "volttron.client.vip": {},
         "volttron.client.vip.agent": {"RPC": RPC},
         "volttron.utils": {"load_config": load_config, "vip_main": vip_main},

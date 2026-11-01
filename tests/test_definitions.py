@@ -5,14 +5,22 @@ import pytest
 from tent.data_manager.reader import known_archive_definitions
 
 from conftest import NODE_DEFINITIONS
-from historian.transactivate_node.definitions import (TableDefinitionMismatch, canonical_json, describe_difference,
-                                                      parse_definitions, validate_definitions)
+from historian.transactivate_node.definitions import (canonical_form, canonical_json, check_definitions,
+                                                      describe_difference, parse_definitions)
 
 RESERVED = {"topics", "data", "known_table_definitions"}
 
 
+def check(definitions, known=frozenset()):
+    return check_definitions(definitions, reserved_names=RESERVED, known_names=set(known))
+
+
 def validate(definitions, known=frozenset()):
-    validate_definitions(definitions, reserved_names=RESERVED, known_names=set(known))
+    """Every definition must pass; the first rejection is raised so the allow-list tests read as assertions."""
+    valid, rejected = check(definitions, known)
+    if rejected:
+        raise ValueError(next(iter(rejected.values())))
+    assert len(valid) == len(definitions)
 
 
 class TestParseDefinitions:
@@ -39,9 +47,27 @@ class TestValidateDefinitions:
     def test_test_schema_is_accepted(self):
         validate(NODE_DEFINITIONS)
 
-    def test_empty_registration_is_an_error(self):
-        with pytest.raises(ValueError, match="No table definitions"):
-            validate([])
+    def test_empty_registration_accepts_nothing(self):
+        assert check([]) == ([], {})
+
+    def test_each_table_is_checked_on_its_own(self):
+        good = {"name": "good", "columns": [{"name": "x", "type": "Integer"}]}
+        bad = {"name": "bad", "columns": [{"name": "x", "type": "PickleType"}]}
+        valid, rejected = check([bad, good, "not a mapping", {"columns": []}])
+        assert valid == [good]
+        assert set(rejected) == {"bad", "#2", "#3"}
+        assert "PickleType" in rejected["bad"]
+        assert "mapping" in rejected["#2"]
+        assert "identifier" in rejected["#3"]
+
+    def test_child_of_a_rejected_parent_is_rejected(self):
+        parent = {"name": "parent", "columns": [{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}]}
+        child = {"name": "child", "inherits": "parent", "columns": [{"name": "id", "foreign_key": "parent.id"}]}
+        grandchild = {"name": "grandchild", "inherits": "child", "columns": [{"name": "id", "foreign_key": "child.id"}]}
+        other = {"name": "other", "columns": [{"name": "x", "type": "Integer"}]}
+        valid, rejected = check([grandchild, child, parent, other])
+        assert valid == [other]
+        assert "was rejected" in rejected["child"] and "was rejected" in rejected["grandchild"]
 
     @pytest.mark.parametrize("name", ["topics", "data", "known_table_definitions"])
     def test_reserved_names_are_refused(self, name):
@@ -100,14 +126,14 @@ class TestValidateDefinitions:
 
     def test_duplicates_are_refused(self):
         table = {"name": "t", "columns": [{"name": "x", "type": "Integer"}]}
-        with pytest.raises(ValueError, match="defined twice"):
-            validate([table, dict(table)])
+        valid, rejected = check([table, dict(table)])
+        assert valid == [table] and "defined twice" in rejected["t"]
         with pytest.raises(ValueError, match="defined twice"):
             validate([{"name": "t", "columns": [{"name": "x", "type": "Integer"}, {"name": "x", "type": "Text"}]}])
 
     def test_inherits_must_be_in_the_batch_or_already_registered(self):
         child = {"name": "child", "inherits": "parent", "columns": [{"name": "id", "foreign_key": "parent.id"}]}
-        with pytest.raises(ValueError, match="inherits"):
+        with pytest.raises(ValueError, match="refers to 'parent'"):
             validate([child])
         validate([child], known={"parent"})
         parent = {"name": "parent", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}}]}
@@ -120,32 +146,42 @@ class TestValidateDefinitions:
             validate([dict(base, indices=[{"name": "idx", "columns": ["a", "zzz"]}])])
         with pytest.raises(ValueError, match="index key"):
             validate([dict(base, indices=[{"name": "idx", "columns": ["a"], "postgresql_using": "gin"}])])
-        validate([dict(base, constraints=[{"name": "fk", "foreign_key": {"columns": ["a", "b"],
-                                                                         "references": ["o.a", "o.b"]}}])])
+        constraint = {"name": "fk", "foreign_key": {"columns": ["a", "b"], "references": ["o.a", "o.b"]}}
+        validate([dict(base, constraints=[constraint])], known={"o"})
+        with pytest.raises(ValueError, match="refers to 'o'"):
+            validate([dict(base, constraints=[constraint])])
         with pytest.raises(ValueError, match="differ in length"):
-            validate([dict(base, constraints=[{"foreign_key": {"columns": ["a"], "references": ["o.a", "o.b"]}}])])
+            validate([dict(base, constraints=[{"foreign_key": {"columns": ["a"], "references": ["o.a", "o.b"]}}])],
+                     known={"o"})
         with pytest.raises(ValueError, match="unsupported constraint key"):
             validate([dict(base, constraints=[{"name": "ck", "check": "a > 0"}])])
 
 
 class TestComparison:
 
-    def test_canonical_json_ignores_key_order_only(self):
+    def test_canonical_form_ignores_key_and_column_order(self):
         definition = NODE_DEFINITIONS[1]
         reordered_keys = {key: definition[key] for key in reversed(list(definition))}
         assert canonical_json(reordered_keys) == canonical_json(definition)
         reordered_columns = dict(definition, columns=list(reversed(definition["columns"])))
-        assert canonical_json(reordered_columns) != canonical_json(definition)
+        assert canonical_json(reordered_columns) == canonical_json(definition)
+        assert [c["name"] for c in canonical_form(definition)["columns"]] == sorted(c["name"] for c in
+                                                                                     definition["columns"])
+        assert definition["columns"][0]["name"] == "id"  # the given definition is not modified
 
-    def test_difference_names_the_changed_lines(self):
-        stored = {"name": "t", "columns": [{"name": "x", "type": "Interval"}]}
-        offered = {"name": "t", "columns": [{"name": "x", "type": "Float"}]}
+    def test_canonical_form_sees_a_changed_column(self):
+        definition = NODE_DEFINITIONS[2]
+        changed = dict(definition, columns=definition["columns"][:-1] + [{"name": "duration", "type": "Float"}])
+        assert canonical_json(changed) != canonical_json(definition)
+        renamed = dict(definition, columns=definition["columns"][:-1] + [{"name": "length", "type": "Interval"}])
+        assert canonical_json(renamed) != canonical_json(definition)
+
+    def test_difference_names_the_changed_lines_and_ignores_column_order(self):
+        stored = {"name": "t", "columns": [{"name": "x", "type": "Interval"}, {"name": "a", "type": "Text"}]}
+        offered = {"name": "t", "columns": [{"name": "a", "type": "Text"}, {"name": "x", "type": "Float"}]}
         diff = describe_difference(stored, offered)
         assert '-   "type": "Interval"' in diff
         assert '+   "type": "Float"' in diff
-        assert describe_difference(stored, dict(stored)) == ""
-
-    def test_mismatch_error_carries_each_difference(self):
-        error = TableDefinitionMismatch({"t": "diff text", "u": "other diff"})
-        assert error.differences == {"t": "diff text", "u": "other diff"}
-        assert "t, u" in str(error) and "diff text" in str(error)
+        assert '"a"' not in "".join(line for line in diff.splitlines() if line[:1] in "+-" and line[:3] not in
+                                      ("---", "+++"))
+        assert describe_difference(stored, dict(stored, columns=list(reversed(stored["columns"])))) == ""

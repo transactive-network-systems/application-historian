@@ -7,8 +7,11 @@ run DDL in the historian's database, every key is checked against an allow-list 
 types are limited to the names below, column keyword arguments to a few booleans, and the table-level keyword arguments
 SQLAlchemy would otherwise pass straight to `Table(...)` (`quote`, `prefixes`, `schema`, ...) are not accepted at all.
 
-The canonical JSON form (`canonical_json`) is what the historian stores in its `known_table_definitions` table and what
-it compares when a table is registered a second time (`describe_difference`).
+`check_definitions` reports a problem per table, so a registration with one bad table can still register the others.
+
+The canonical form (`canonical_form`, `canonical_json`) is what the historian compares when a table is registered a
+second time and what `describe_difference` diffs: keys sorted, columns sorted by name. Column order therefore does not
+matter for the comparison; the table is created with the columns in the order the first registration gave them.
 """
 import difflib
 import enum
@@ -33,17 +36,6 @@ CONSTRAINT_KEYS = {'name', 'foreign_key'}
 FOREIGN_KEY_CONSTRAINT_KEYS = {'columns', 'references'}
 
 
-class TableDefinitionMismatch(ValueError):
-    """A table was registered again with a definition that differs from the stored one."""
-
-    def __init__(self, differences: Mapping[str, str]):
-        self.differences = dict(differences)
-        names = ', '.join(sorted(self.differences))
-        super().__init__(f'Table definition(s) differ from the registered ones: {names}. '
-                         'The archive keeps the definition a table was created with; rename the table or create a '
-                         'new database if the schema has changed.\n' + '\n'.join(self.differences.values()))
-
-
 def parse_definitions(definitions) -> list[dict]:
     """
     Accept the forms callers send: a list of definitions, a JSON string of one, a {name: definition} mapping, or a
@@ -65,60 +57,124 @@ def parse_definitions(definitions) -> list[dict]:
     return [dict(d) if isinstance(d, Mapping) else d for d in definitions]
 
 
+def canonical_form(definition: Mapping) -> dict:
+    """The definition with its columns sorted by name (key order is handled by sort_keys when serialising)."""
+    canonical = dict(definition)
+    columns = canonical.get('columns')
+    if isinstance(columns, Sequence) and not isinstance(columns, (str, bytes)):
+        canonical['columns'] = sorted((dict(c) for c in columns if isinstance(c, Mapping)),
+                                      key=lambda c: str(c.get('name')))
+    return canonical
+
+
 def canonical_json(definition: Mapping) -> str:
-    return json.dumps(definition, sort_keys=True, separators=(',', ':'))
+    return json.dumps(canonical_form(definition), sort_keys=True, separators=(',', ':'))
 
 
 def describe_difference(stored: Mapping, offered: Mapping) -> str:
     """A unified diff of the two definitions' pretty-printed canonical forms, for logs and RPC error replies."""
-    before = json.dumps(stored, sort_keys=True, indent=1).splitlines()
-    after = json.dumps(offered, sort_keys=True, indent=1).splitlines()
+    before = json.dumps(canonical_form(stored), sort_keys=True, indent=1).splitlines()
+    after = json.dumps(canonical_form(offered), sort_keys=True, indent=1).splitlines()
     return '\n'.join(difflib.unified_diff(before, after, fromfile='registered', tofile='offered', lineterm=''))
 
 
-def validate_definitions(definitions: Sequence[Mapping], reserved_names: set[str], known_names: set[str]) -> None:
+def check_definitions(definitions: Sequence, reserved_names: set[str],
+                      known_names: set[str]) -> tuple[list[dict], dict[str, str]]:
     """
-    Raise ValueError describing the first problem found. `reserved_names` are the historian's own tables, which a peer
-    may not define; `known_names` are tables already registered, which an `inherits` clause may refer to.
+    Check each definition on its own and return (valid definitions in the order given, {table: reason} for the
+    rejected ones). A definition without a usable name is keyed "#<position>". `reserved_names` are the historian's
+    own tables, which may not be defined; `known_names` are tables already registered, which `inherits` may refer to.
+    A table whose parent is rejected, or is neither in the batch nor known, is rejected too.
     """
-    if not definitions:
-        raise ValueError('No table definitions were supplied.')
+    valid: list[dict] = []
+    rejected: dict[str, str] = {}
     names_in_batch: set[str] = set()
-    for definition in definitions:
-        if not isinstance(definition, Mapping):
-            raise ValueError(f'Each table definition must be a mapping, not {type(definition).__name__}.')
-        name = definition.get('name')
-        _require_identifier(name, 'table name')
-        if name in reserved_names:
-            raise ValueError(f'Table {name!r} is reserved by the historian and cannot be registered.')
-        if name in names_in_batch:
-            raise ValueError(f'Table {name!r} is defined twice in one registration.')
+    for position, definition in enumerate(definitions):
+        name = definition.get('name') if isinstance(definition, Mapping) else None
+        key = name if isinstance(name, str) and IDENTIFIER.match(name) else f'#{position}'
+        try:
+            if not isinstance(definition, Mapping):
+                raise ValueError(f'Each table definition must be a mapping, not {type(definition).__name__}.')
+            _validate_table(definition, reserved_names)
+            if name in names_in_batch:
+                raise ValueError(f'Table {name!r} is defined twice in one registration.')
+        except ValueError as error:
+            rejected[key] = str(error)
+            continue
         names_in_batch.add(name)
-        unexpected = set(definition) - TABLE_KEYS
-        if unexpected:
-            raise ValueError(f'Table {name!r}: unsupported definition key(s) {sorted(unexpected)}. '
-                             f'Allowed: {sorted(TABLE_KEYS)}.')
-        columns = definition.get('columns')
-        if not isinstance(columns, Sequence) or isinstance(columns, (str, bytes)) or not columns:
-            raise ValueError(f'Table {name!r}: "columns" must be a non-empty list.')
-        column_names: set[str] = set()
-        for column in columns:
-            _validate_column(name, column)
-            if column['name'] in column_names:
-                raise ValueError(f'Table {name!r}: column {column["name"]!r} is defined twice.')
-            column_names.add(column['name'])
-        parent = definition.get('inherits')
-        if parent is not None:
-            _require_identifier(parent, f'table {name!r}: "inherits"')
-        for index in definition.get('indices', []):
-            _validate_index(name, index, column_names)
-        for constraint in definition.get('constraints', []):
-            _validate_constraint(name, constraint, column_names)
-    for definition in definitions:
-        parent = definition.get('inherits')
-        if parent is not None and parent not in names_in_batch and parent not in known_names:
-            raise ValueError(f'Table {definition["name"]!r} inherits from {parent!r}, which is neither in this '
-                             f'registration nor already registered.')
+        valid.append(dict(definition))
+    # Resolve references after every table has been checked; a rejected parent or target takes its dependants with it.
+    reject_unresolved(valid, rejected, known_names)
+    return valid, rejected
+
+
+def dependencies(definition: Mapping) -> set[str]:
+    """Tables a definition needs to exist: its `inherits` parent and every foreign-key target other than itself."""
+    needed = set()
+    if definition.get('inherits'):
+        needed.add(definition['inherits'])
+    for column in definition.get('columns', []):
+        if isinstance(column, Mapping) and isinstance(column.get('foreign_key'), str):
+            needed.add(column['foreign_key'].split('.')[0])
+    for constraint in definition.get('constraints', []):
+        if isinstance(constraint, Mapping) and isinstance(constraint.get('foreign_key'), Mapping):
+            for reference in constraint['foreign_key'].get('references', []):
+                if isinstance(reference, str):
+                    needed.add(reference.split('.')[0])
+    needed.discard(definition.get('name'))
+    return needed
+
+
+def reject_unresolved(valid: list[dict], rejected: dict[str, str], available: set[str]) -> None:
+    """
+    Move every definition in `valid` whose dependencies are neither in `available` nor among the other valid
+    definitions into `rejected` (in place), repeating until nothing changes so chains of dependants fall together.
+    """
+    changed = True
+    while changed:
+        changed = False
+        accepted = {d['name'] for d in valid}
+        for definition in list(valid):
+            missing = dependencies(definition) - available - accepted
+            if not missing:
+                continue
+            name = definition['name']
+            reasons = []
+            for target in sorted(missing):
+                if target in rejected:
+                    reasons.append(f'{target!r}, which was rejected')
+                else:
+                    reasons.append(f'{target!r}, which is neither in this registration nor already registered')
+            rejected[name] = f'Table {name!r} refers to ' + ' and '.join(reasons) + '.'
+            valid.remove(definition)
+            changed = True
+
+
+def _validate_table(definition: Mapping, reserved_names: set[str]) -> None:
+    name = definition.get('name')
+    _require_identifier(name, 'table name')
+    if name in reserved_names:
+        raise ValueError(f'Table {name!r} is reserved by the historian and cannot be registered.')
+    unexpected = set(definition) - TABLE_KEYS
+    if unexpected:
+        raise ValueError(f'Table {name!r}: unsupported definition key(s) {sorted(unexpected)}. '
+                         f'Allowed: {sorted(TABLE_KEYS)}.')
+    columns = definition.get('columns')
+    if not isinstance(columns, Sequence) or isinstance(columns, (str, bytes)) or not columns:
+        raise ValueError(f'Table {name!r}: "columns" must be a non-empty list.')
+    column_names: set[str] = set()
+    for column in columns:
+        _validate_column(name, column)
+        if column['name'] in column_names:
+            raise ValueError(f'Table {name!r}: column {column["name"]!r} is defined twice.')
+        column_names.add(column['name'])
+    parent = definition.get('inherits')
+    if parent is not None:
+        _require_identifier(parent, f'table {name!r}: "inherits"')
+    for index in definition.get('indices', []):
+        _validate_index(name, index, column_names)
+    for constraint in definition.get('constraints', []):
+        _validate_constraint(name, constraint, column_names)
 
 
 def _require_identifier(value, what: str) -> None:

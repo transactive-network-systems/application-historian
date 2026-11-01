@@ -12,8 +12,8 @@ Before running:
 
 Run with VOLTTRON_HOME set, e.g.:  pixi run python scripts/inject_simple.py
 
-The archive topic prefix must match the historian's custom_topics.capture_record_data entry (case-sensitive; "tns/"
-in this project's containers). Adjust the table name, columns and data below for your own schema; keep an "id"
+Envelopes go on <ARCHIVE_PREFIX>/archive/<NODE>/records; ARCHIVE_PREFIX must match the historian's
+custom_topics.capture_record_data entry (case-sensitive; "tns/archive/" in this project's containers). Adjust the table name, columns and data below for your own schema; keep an "id"
 primary key column and do not include it in the data payload.
 """
 
@@ -47,6 +47,7 @@ def main():
     test_table_name = "test_transactive_records"
     HISTORIAN_VIP = "tns.historian"
     ARCHIVE_PREFIX = "tns"
+    NODE = "test_injector"
     
     print("=" * 60)
     print("TNS Historian Test Data Injection")
@@ -92,8 +93,8 @@ def main():
             print("Records will remain retryable until the table is registered.")
         
         # Publish test records
-        print(f"\nPublishing test records to {ARCHIVE_PREFIX}/{test_table_name}...")
-        topic = f"{ARCHIVE_PREFIX}/{test_table_name}"
+        topic = f"{ARCHIVE_PREFIX}/archive/{NODE}/records"
+        print(f"\nPublishing test records to {topic}...")
         standard_topic = f"record/{test_table_name}"
         
         now = format_timestamp(datetime.utcnow())

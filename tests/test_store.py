@@ -8,7 +8,6 @@ from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, 
 from sqlalchemy.exc import OperationalError
 
 from conftest import NODE_DEFINITIONS, TABLE_NAMES, envelope_record, standard_record
-from historian.transactivate_node.definitions import TableDefinitionMismatch
 from historian.transactivate_node.store import KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
 from tent.enumerations import MarketTypes
 
@@ -77,8 +76,12 @@ def test_setup_creates_the_historians_own_tables(connection, db_url):
 
 def test_register_persists_definitions_and_creates_tables(connection, db_url):
     store = open_store(connection)
-    registered = store.register_definitions(NODE_DEFINITIONS)
-    assert registered == ["component", "market", "time_interval"]
+    result = store.register_definitions(NODE_DEFINITIONS)
+    assert result.status == "success"
+    assert result.registered == ["component", "market", "time_interval"]
+    assert result.created == ["component", "market", "time_interval"]
+    assert result.rejected == {}
+    assert "3 table(s) created" in result.message
     assert store.writable_tables == {"component", "market", "time_interval"}
     present = set(inspect(create_engine(db_url)).get_table_names())
     assert {"component", "market", "time_interval"} <= present
@@ -89,54 +92,126 @@ def test_register_persists_definitions_and_creates_tables(connection, db_url):
     assert all(row[2] for row in rows)
 
 
-def test_identical_re_registration_registers_nothing_and_is_not_an_error(connection):
+def test_identical_re_registration_is_a_success_that_creates_nothing(connection):
     store = open_store(connection)
     store.register_definitions(NODE_DEFINITIONS)
     shuffled_keys = [dict(reversed(list(d.items()))) for d in NODE_DEFINITIONS]
-    assert store.register_definitions(shuffled_keys[::-1]) == []  # order of tables and of keys does not matter
-    assert store.register_definitions([NODE_DEFINITIONS[0]]) == []
+    result = store.register_definitions(shuffled_keys[::-1])  # order of tables and of keys does not matter
+    assert result.status == "success"
+    assert sorted(result.registered) == ["component", "market", "time_interval"]
+    assert result.created == [] and result.rejected == {}
+    assert "already registered with an identical definition" in result.message
 
 
-def test_reordered_columns_are_a_different_definition(connection):
+def test_reordered_columns_are_the_same_definition(connection):
     store = open_store(connection)
     store.register_definitions(NODE_DEFINITIONS)
     reordered = dict(NODE_DEFINITIONS[0], columns=list(reversed(NODE_DEFINITIONS[0]["columns"])))
-    with pytest.raises(TableDefinitionMismatch):
-        store.register_definitions([reordered])
+    result = store.register_definitions([reordered])
+    assert result.status == "success" and result.registered == ["component"] and result.created == []
 
 
-def test_changed_re_registration_is_refused_with_the_difference(connection):
+def test_new_table_keeps_the_given_column_order(connection, db_url):
+    store = open_store(connection)
+    definition = {"name": "ordered", "columns": [{"name": "zeta", "type": "Integer", "kwargs": {"primary_key": True}},
+                                                 {"name": "alpha", "type": "Text"}]}
+    store.register_definitions([definition])
+    columns = [c["name"] for c in inspect(create_engine(db_url)).get_columns("ordered")]
+    assert columns == ["zeta", "alpha"]
+    restarted = open_store(connection)
+    assert [c.name for c in restarted.data_manager.tables["ordered"].columns] == ["zeta", "alpha"]
+
+
+def test_changed_re_registration_is_rejected_with_the_difference_and_the_rest_registered(connection):
     store = open_store(connection)
     store.register_definitions(NODE_DEFINITIONS)
     changed = dict(NODE_DEFINITIONS[2])
     changed["columns"] = changed["columns"][:-1] + [{"name": "duration", "type": "Float"}]
-    with pytest.raises(TableDefinitionMismatch) as error:
-        store.register_definitions([NODE_DEFINITIONS[0], changed])
-    assert set(error.value.differences) == {"time_interval"}
-    diff = error.value.differences["time_interval"]
-    assert '-   "type": "Interval"' in diff and '+   "type": "Float"' in diff
-    assert "time_interval" in str(error.value)
-    # nothing changed
-    assert store.writable_tables == {"component", "market", "time_interval"}
+    result = store.register_definitions([NODE_DEFINITIONS[0], changed])
+    assert result.status == "partial"
+    assert result.registered == ["component"]
+    assert set(result.rejected) == {"time_interval"}
+    rejection = result.rejected["time_interval"]
+    assert "different definition" in rejection["message"]
+    assert '-   "type": "Interval"' in rejection["differences"] and '+   "type": "Float"' in rejection["differences"]
+    assert store.writable_tables == {"component", "market", "time_interval"}  # nothing changed in the database
+    only_changed = store.register_definitions([changed])
+    assert only_changed.status == "error" and only_changed.registered == []
 
 
-def test_invalid_definition_is_refused_before_anything_is_stored(connection):
+def test_invalid_definition_is_rejected_and_the_valid_ones_registered(connection):
     store = open_store(connection)
     bad = dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
-    with pytest.raises(ValueError, match="PickleType"):
-        store.register_definitions([bad, NODE_DEFINITIONS[1]])
+    other = {"name": "other", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}}]}
+    result = store.register_definitions([bad, other])
+    assert result.status == "partial"
+    assert result.registered == ["other"]
+    assert "PickleType" in result.rejected["component"]["message"]
+    assert result.rejected["component"]["differences"] is None
+    assert store.registered_tables == {"other"}
+
+
+def test_tables_referring_to_a_rejected_table_are_rejected_with_it(connection):
+    store = open_store(connection)
+    bad = dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
+    result = store.register_definitions([bad, NODE_DEFINITIONS[1], NODE_DEFINITIONS[2]])  # market inherits component,
+    assert result.status == "error"                                                     # time_interval -> market
+    assert set(result.rejected) == {"component", "market", "time_interval"}
+    assert "'component', which was rejected" in result.rejected["market"]["message"]
+    assert "'market', which was rejected" in result.rejected["time_interval"]["message"]
     assert store.registered_tables == set()
+    assert store.data_manager.query_data(KNOWN_TABLE_DEFINITIONS) == []
+
+
+def test_foreign_key_to_an_unknown_table_is_rejected_not_created(connection, db_url):
+    store = open_store(connection)
+    result = store.register_definitions([NODE_DEFINITIONS[2]])  # time_interval.market_id -> market, never registered
+    assert result.status == "error"
+    assert "neither in this registration nor already registered" in result.rejected["time_interval"]["message"]
+    assert "time_interval" not in inspect(create_engine(db_url)).get_table_names()
+    store.register_definitions(NODE_DEFINITIONS[:2])
+    assert store.register_definitions([NODE_DEFINITIONS[2]]).status == "success"  # target now registered
+
+
+def test_self_reference_and_reference_to_reflected_table_are_allowed(connection, db_url):
+    metadata = MetaData()
+    Table("legacy_notes", metadata, Column("id", Integer, primary_key=True))
+    metadata.create_all(create_engine(db_url))
+    store = open_store(connection)
+    result = store.register_definitions([
+        {"name": "chain", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}},
+                                      {"name": "prior_id", "foreign_key": "chain.id"},
+                                      {"name": "note_id", "foreign_key": "legacy_notes.id"}]}])
+    assert result.status == "success"
+
+
+def test_unchanged_child_of_a_mismatched_but_existing_parent_is_registered(connection):
+    store = open_store(connection)
+    store.register_definitions([NODE_DEFINITIONS[0]])
+    changed_parent = dict(NODE_DEFINITIONS[0], columns=NODE_DEFINITIONS[0]["columns"] + [{"name": "x", "type": "Text"}])
+    result = store.register_definitions([changed_parent, NODE_DEFINITIONS[1]])
+    assert result.status == "partial"  # market is unchanged and its parent exists with the stored definition
+    assert result.registered == ["market"] and set(result.rejected) == {"component"}
+    assert store.registered_tables == {"component", "market"}
+
+
+def test_empty_registration_is_an_error_outcome(connection):
+    result = open_store(connection).register_definitions([])
+    assert result.status == "error" and result.message == "No table definitions were supplied."
 
 
 def test_registering_a_reserved_table_is_refused(connection):
     store = open_store(connection)
-    with pytest.raises(ValueError, match="reserved"):
-        store.register_definitions([{"name": "topics", "columns": [{"name": "x", "type": "Integer"}]}])
+    result = store.register_definitions([{"name": "topics", "columns": [{"name": "x", "type": "Integer"}]}])
+    assert result.status == "error" and "reserved" in result.rejected["topics"]["message"]
 
 
 def test_configured_definitions_are_registered_at_setup(connection):
     store = open_store(connection, NODE_DEFINITIONS)
     assert store.writable_tables == {"component", "market", "time_interval"}
+    bad = [dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType"}])]
+    with pytest.raises(ValueError, match="PickleType"):
+        open_store(connection, bad)
 
 
 # ---------------------------------------------------------------- restart
@@ -158,8 +233,8 @@ def test_restart_with_a_changed_definition_is_still_refused(connection):
     open_store(connection).register_definitions(NODE_DEFINITIONS)
     restarted = open_store(connection)
     changed = dict(NODE_DEFINITIONS[0], columns=NODE_DEFINITIONS[0]["columns"] + [{"name": "extra", "type": "Text"}])
-    with pytest.raises(TableDefinitionMismatch):
-        restarted.register_definitions([changed])
+    result = restarted.register_definitions([changed])
+    assert result.status == "error" and "component" in result.rejected
 
 
 def test_table_without_definition_is_reflected_with_a_warning_and_accepts_rows(connection, db_url, caplog):
@@ -184,10 +259,10 @@ def test_registering_a_reflected_table_replaces_reflection_with_the_definition(c
     store = open_store(connection)
     definition = {"name": "legacy_notes", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}},
                                                       {"name": "note", "type": "String", "type_args": [50]}]}
-    assert store.register_definitions([definition]) == ["legacy_notes"]
+    assert store.register_definitions([definition]).created == ["legacy_notes"]
     assert "legacy_notes" in store.registered_tables
     assert "legacy_notes" not in store.reflected_tables
-    assert store.register_definitions([definition]) == []
+    assert store.register_definitions([definition]).created == []
 
 
 # ---------------------------------------------------------------- envelope writes

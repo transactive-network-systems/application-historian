@@ -114,11 +114,15 @@ def test_create_tables_is_exported_as_an_rpc():
 def test_create_tables_registers_persists_and_reports(connection, db_url):
     agent = running_historian(connection)
     reply = agent.create_tables(NODE_DEFINITIONS)
-    assert reply == {"status": "success", "registered_tables": ["component", "market", "time_interval"],
-                     "known_tables": ["component", "market", "time_interval"]}
+    assert reply["status"] == "success"
+    assert reply["registered_tables"] == ["component", "market", "time_interval"]
+    assert reply["rejected_tables"] == {}
+    assert "3 table(s) created" in reply["message"]
+    assert set(reply) == {"status", "registered_tables", "rejected_tables", "message"}
     assert KNOWN_TABLE_DEFINITIONS in inspect(create_engine(db_url)).get_table_names()
     again = agent.create_tables(NODE_DEFINITIONS)  # a second node registering the same schema
-    assert again["status"] == "success" and again["registered_tables"] == []
+    assert again["status"] == "success" and again["registered_tables"] == ["component", "market", "time_interval"]
+    assert "identical" in again["message"]
 
 
 def test_create_tables_accepts_the_mapping_form(connection):
@@ -127,27 +131,38 @@ def test_create_tables_accepts_the_mapping_form(connection):
     assert reply["status"] == "success"
 
 
-def test_create_tables_reports_a_changed_definition_as_an_error_with_the_difference(connection):
+def test_create_tables_reports_a_changed_definition_and_registers_the_rest(connection):
     agent = running_historian(connection)
     agent.create_tables(NODE_DEFINITIONS)
     changed = dict(NODE_DEFINITIONS[2], columns=NODE_DEFINITIONS[2]["columns"][:-1] + [{"name": "duration",
                                                                                          "type": "Float"}])
-    reply = agent.create_tables([changed])
-    assert reply["status"] == "error"
+    reply = agent.create_tables([NODE_DEFINITIONS[1], changed])
+    assert reply["status"] == "partial"
+    assert reply["registered_tables"] == ["market"]
+    assert set(reply["rejected_tables"]) == {"time_interval"}
+    assert '+   "type": "Float"' in reply["rejected_tables"]["time_interval"]["differences"]
     assert "time_interval" in reply["message"]
-    assert set(reply["differences"]) == {"time_interval"}
-    assert '+   "type": "Float"' in reply["differences"]["time_interval"]
+    alone = agent.create_tables([changed])
+    assert alone["status"] == "error" and alone["registered_tables"] == []
+
+
+def test_create_tables_with_reordered_columns_is_a_success(connection):
+    agent = running_historian(connection)
+    agent.create_tables(NODE_DEFINITIONS)
+    reordered = [dict(d, columns=list(reversed(d["columns"]))) for d in NODE_DEFINITIONS]
+    reply = agent.create_tables(reordered)
+    assert reply["status"] == "success" and reply["rejected_tables"] == {}
 
 
 def test_create_tables_rejects_disallowed_definitions(connection):
     agent = running_historian(connection)
     reply = agent.create_tables([{"name": "evil", "columns": [{"name": "x", "type": "Integer"}],
                                   "kwargs": {"quote": False}}])
-    assert reply["status"] == "error" and "unsupported definition key" in reply["message"]
+    assert reply["status"] == "error" and "unsupported definition key" in reply["rejected_tables"]["evil"]["message"]
     reply = agent.create_tables([{"name": "topics", "columns": [{"name": "x", "type": "Integer"}]}])
-    assert reply["status"] == "error" and "reserved" in reply["message"]
+    assert reply["status"] == "error" and "reserved" in reply["rejected_tables"]["topics"]["message"]
     reply = agent.create_tables("not json")
-    assert reply["status"] == "error"
+    assert reply["status"] == "error" and reply["rejected_tables"] == {}
     assert agent.store.registered_tables == set()
 
 
@@ -167,6 +182,28 @@ def test_envelopes_are_stored_and_the_batch_is_acknowledged(connection):
     rows = agent.store.data_manager.query_data("market")
     assert rows[0]["id"] == uuid.UUID(MARKET_ID)
     assert rows[0]["active"] is False
+
+
+def test_non_envelope_on_the_records_topic_is_dropped_not_stored_as_a_record(connection, caplog):
+    agent = running_historian(connection)
+    agent.publish_to_historian([standard_record(topic="tns/archive/campus/records", value={"not": "an envelope"})])
+    assert agent.handled_all == 1
+    assert agent.query_topic_list() == []
+    assert any("not an archive envelope" in r.message for r in caplog.records)
+
+
+def test_transactive_signal_topics_are_outside_the_archive_prefix():
+    """The deployed capture prefix is tns/archive/; node-to-node signals on tns/<sender>/<receiver> are not captured."""
+    import json
+    from pathlib import Path
+    config = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text())
+    prefixes = config["custom_topics"]["capture_record_data"]
+    assert prefixes == ["tns/archive/"]
+    for signal_topic in ("tns/campus/city", "tns/city/campus", "tns/archive"):
+        assert not any(signal_topic.startswith(prefix) for prefix in prefixes)
+    assert TransactiveNodeHistorian.parse_archive_topic("tns/campus/city") is None
+    assert TransactiveNodeHistorian.parse_archive_topic("tns/archive/campus/records") == ("tns", "campus", "records")
+    assert TransactiveNodeHistorian.parse_archive_topic("tns/archive//records") is None
 
 
 def test_unknown_table_is_dropped_and_the_batch_is_still_acknowledged(connection, caplog):
@@ -207,11 +244,106 @@ def test_mixed_batch_routes_by_payload_shape(connection):
     agent = running_historian(connection)
     agent.create_tables(NODE_DEFINITIONS)
     agent.publish_to_historian([
-        standard_record(topic="tns/campus/archive", value={"not": "an envelope"}, record_id=1),
+        standard_record(topic="tns/other", value={"not": "an envelope"}, record_id=1),
         envelope_record([market_envelope()], record_id=2),
         standard_record(topic="record/plain", value=3, record_id=3),
     ])
-    assert agent.query_topic_list() == ["tns/campus/archive", "record/plain"]
+    assert agent.query_topic_list() == ["tns/other", "record/plain"]
+    assert len(agent.store.data_manager.query_data("market")) == 1
+
+
+# ---------------------------------------------------------------- pubsub registration path
+def definitions_message(definitions=NODE_DEFINITIONS, node="campus", request_id="req-1"):
+    return standard_record(topic=f"tns/archive/{node}/definitions",
+                           value={"node": node, "request_id": request_id, "definitions": definitions})
+
+
+def test_definitions_message_registers_and_publishes_success(connection):
+    agent = running_historian(connection)
+    agent.publish_to_historian([definitions_message()])
+    assert agent.handled_all == 1
+    assert agent.store.registered_tables == {"component", "market", "time_interval"}
+    [(topic, headers, message)] = agent.vip.pubsub.published
+    assert topic == "tns/archive/campus/status"
+    assert headers["Date"] and headers["TimeStamp"]
+    assert message == {"request_id": "req-1", "node": "campus", "status": "success",
+                       "registered_tables": ["component", "market", "time_interval"], "rejected_tables": {},
+                       "message": message["message"]}
+    agent.publish_to_historian([definitions_message(request_id="req-2")])  # idempotent
+    assert agent.vip.pubsub.published[-1][2]["status"] == "success"
+    assert agent.vip.pubsub.published[-1][2]["request_id"] == "req-2"
+
+
+def test_definitions_then_records_in_one_batch_are_stored(connection):
+    agent = running_historian(connection)
+    agent.publish_to_historian([definitions_message(), envelope_record([market_envelope()], record_id=2)])
+    assert len(agent.store.data_manager.query_data("market")) == 1
+
+
+def test_definitions_message_partial_and_error_status(connection):
+    agent = running_historian(connection)
+    agent.publish_to_historian([definitions_message()])
+    changed = dict(NODE_DEFINITIONS[2], columns=NODE_DEFINITIONS[2]["columns"][:-1] + [{"name": "duration",
+                                                                                         "type": "Float"}])
+    agent.publish_to_historian([definitions_message([NODE_DEFINITIONS[0], changed], request_id="req-p")])
+    status = agent.vip.pubsub.published[-1][2]
+    assert status["status"] == "partial" and status["request_id"] == "req-p"
+    assert status["registered_tables"] == ["component"]
+    assert '+   "type": "Float"' in status["rejected_tables"]["time_interval"]["differences"]
+
+    agent.publish_to_historian([definitions_message([changed], request_id="req-e")])
+    status = agent.vip.pubsub.published[-1][2]
+    assert status["status"] == "error" and status["registered_tables"] == []
+    assert set(status["rejected_tables"]) == {"time_interval"}
+
+
+def test_malformed_definitions_message_gets_an_error_status_only_with_a_request_id(connection, caplog):
+    agent = running_historian(connection)
+    agent.publish_to_historian([standard_record(topic="tns/archive/campus/definitions", value="garbage")])
+    assert agent.vip.pubsub.published == []
+    assert agent.handled_all == 1
+    assert any("Malformed definitions message" in r.message for r in caplog.records)
+
+    agent.publish_to_historian([standard_record(topic="tns/archive/campus/definitions",
+                                                value={"request_id": "req-m", "node": "campus"})])
+    [(topic, _, message)] = agent.vip.pubsub.published
+    assert topic == "tns/archive/campus/status"
+    assert message["status"] == "error" and message["request_id"] == "req-m" and message["registered_tables"] == []
+    assert "Malformed" in message["message"]
+    assert agent.query_topic_list() == []  # neither message was stored as a record
+
+
+def test_own_status_publication_is_ignored(connection):
+    agent = running_historian(connection)
+    status = {"request_id": "req-1", "node": "campus", "status": "success", "registered_tables": [],
+              "rejected_tables": {}, "message": "x"}
+    agent.publish_to_historian([standard_record(topic="tns/archive/campus/status", value=status)])
+    assert agent.handled_all == 1
+    assert agent.query_topic_list() == []
+    assert agent.vip.pubsub.published == []
+
+
+def test_status_publish_failure_is_logged_not_raised(connection, caplog):
+    agent = running_historian(connection)
+
+    def failing_publish(*args, **kwargs):
+        raise RuntimeError("bus down")
+
+    agent.vip.pubsub.publish = failing_publish
+    agent.publish_to_historian([definitions_message()])
+    assert agent.handled_all == 1
+    assert agent.store.registered_tables == {"component", "market", "time_interval"}
+    assert any("Could not publish the registration status" in r.message for r in caplog.records)
+
+
+def test_records_topic_with_a_different_prefix_is_still_routed(connection):
+    agent = running_historian(connection)
+    agent.publish_to_historian([standard_record(topic="other/prefix/archive/city/definitions",
+                                                value={"node": "city", "request_id": "r", "definitions":
+                                                       NODE_DEFINITIONS}),
+                                envelope_record([market_envelope()], topic="other/prefix/archive/city/records",
+                                                record_id=2)])
+    assert agent.vip.pubsub.published[0][0] == "other/prefix/archive/city/status"
     assert len(agent.store.data_manager.query_data("market")) == 1
 
 

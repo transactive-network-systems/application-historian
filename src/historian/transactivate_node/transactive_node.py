@@ -8,11 +8,15 @@ It serves two kinds of record through one BaseHistorian subscription set:
   `data` tables and answered through the standard query RPCs (`query`, `get_topic_list`, `get_topics_by_pattern`,
   `get_topics_metadata`), so that the agent can be installed as the platform's historian;
 - TENT archive envelopes, `{"table_name": ..., "data": {...}}` or lists of them, which a TransactiveNodeAgent's
-  VolttronDataManager publishes on `<db_topic>/<node>/archive` after registering its table definitions with the
-  `create_tables` RPC. Envelopes are stored in the registered archive tables.
+  VolttronDataManager publishes on `<db_topic>/archive/<node>/records` after registering its table definitions,
+  either with the `create_tables` RPC (default) or by publishing them on `<db_topic>/archive/<node>/definitions`;
+  the historian answers the pubsub path on `<db_topic>/archive/<node>/status`. Envelopes are stored in the
+  registered archive tables.
 
-Routing is by payload shape, not topic. All database handling is in `HistorianStore` (store.py); this module is the
-VOLTTRON shell: configuration from the config store, RPC exports and the BaseHistorian publishing contract.
+Topics under `<db_topic>/archive/` are routed by their last segment (records, definitions, status); every other
+captured topic is a standard record, except that an archive envelope is recognised by shape wherever it arrives. All
+database handling is in `HistorianStore` (store.py); this module is the VOLTTRON shell: configuration from the config
+store, RPC exports, the pubsub registration path and the BaseHistorian publishing contract.
 
 Identity: VOLTTRON historians are conventionally installed as `platform.historian` (`DEFAULT_VIP_IDENTITY`); the
 modular platform assigns the identity at `vctl install --vip-identity`, so a deployment may choose another (the TENT
@@ -23,15 +27,18 @@ no aggregate tables, and an aggregate query raises rather than returning an empt
 """
 import logging
 import sys
+from collections.abc import Mapping
+from datetime import datetime, timezone
 
 from historian.base.base_historian import BaseHistorian
 from volttron.client.known_identities import PLATFORM_HISTORIAN
 from volttron.client.logs import setup_logging
+from volttron.client.messaging import headers as headers_mod
 from volttron.client.vip.agent import RPC
 from volttron.utils import load_config, vip_main
 
-from historian.transactivate_node.definitions import TableDefinitionMismatch, parse_definitions
-from historian.transactivate_node.store import HistorianStore
+from historian.transactivate_node.definitions import parse_definitions
+from historian.transactivate_node.store import HistorianStore, RegistrationResult
 
 __version__ = "3.0.0"
 
@@ -39,6 +46,9 @@ setup_logging()
 _log = logging.getLogger(__name__)
 
 DEFAULT_VIP_IDENTITY = PLATFORM_HISTORIAN
+
+ARCHIVE_SEGMENT = "archive"
+RECORDS_TOPIC, DEFINITIONS_TOPIC, STATUS_TOPIC = "records", "definitions", "status"
 
 CONFIGURATION_HELP = ('Store the historian configuration as the config-store entry "config" of the historian\'s VIP '
                       'identity, e.g. vctl config store <identity> config tns-historian.json. It must contain '
@@ -108,47 +118,134 @@ class TransactiveNodeHistorian(BaseHistorian):
         _log.info(f"Historian ready; archive tables: {sorted(self.store.writable_tables)}")
 
     def publish_to_historian(self, to_publish_list):
-        """Persist one BaseHistorian batch. Every record is reported handled: rows that cannot be stored are logged."""
+        """
+        Persist one BaseHistorian batch. Topics under `<prefix>/archive/<node>/` are handled by kind: `records` carry
+        envelopes, `definitions` carry a registration request (answered on `status`), `status` is the historian's own
+        reply coming back through its capture and is ignored. Everything else is written as it comes. Every record is
+        reported handled: rows that cannot be stored are logged, not retried.
+        """
         if self.store is None or not self.store.ready:
             raise RuntimeError(f'The historian database is not open; {len(to_publish_list)} record(s) stay cached. '
                                f'{CONFIGURATION_HELP}')
-        result = self.store.write(to_publish_list)
-        if result.dropped:
-            _log.error(f"Dropped {result.dropped} archive row(s) in this batch for unregistered tables: "
-                       f"{dict(result.skipped_unknown_table)}.")
+        to_write = []
+        for record in to_publish_list:
+            parsed = self.parse_archive_topic(record["topic"])
+            if parsed is None:
+                to_write.append(record)
+                continue
+            prefix, node, kind = parsed
+            if kind == RECORDS_TOPIC:
+                if HistorianStore.is_envelope_payload(record.get("value")):
+                    to_write.append(record)
+                else:
+                    _log.error(f'Dropped a message on {record["topic"]!r} that is not an archive envelope or a list '
+                               f'of them: {str(record.get("value"))[:200]!r}')
+            elif kind == DEFINITIONS_TOPIC:
+                self._handle_definitions_message(prefix, node, record.get("value"))
+            else:  # STATUS_TOPIC: the historian's own publication
+                _log.debug(f'Ignoring the historian\'s own status publication on {record["topic"]!r}')
+        if to_write:
+            result = self.store.write(to_write)
+            if result.dropped:
+                _log.error(f"Dropped {result.dropped} archive row(s) in this batch for unregistered tables: "
+                           f"{dict(result.skipped_unknown_table)}.")
         self.report_all_handled()
+
+    @staticmethod
+    def parse_archive_topic(topic):
+        """(prefix, node, kind) for `<prefix>/archive/<node>/<records|definitions|status>`, else None."""
+        parts = topic.split("/")
+        if (len(parts) < 4 or parts[-3] != ARCHIVE_SEGMENT or not parts[-2]
+                or parts[-1] not in (RECORDS_TOPIC, DEFINITIONS_TOPIC, STATUS_TOPIC)):
+            return None
+        return "/".join(parts[:-3]), parts[-2], parts[-1]
+
+    # ---------------------------------------------------------------- pubsub registration path
+    def _handle_definitions_message(self, prefix, node, message):
+        """
+        Register the definitions in a `{"node", "request_id", "definitions"}` message and publish the outcome on
+        `<prefix>/archive/<node>/status`. A malformed message is logged; it gets an "error" status reply only when it
+        carries a request_id to answer.
+        """
+        request_id = message.get("request_id") if isinstance(message, Mapping) else None
+        if not isinstance(request_id, str) or not request_id:
+            request_id = None
+        if not isinstance(message, Mapping) or "definitions" not in message:
+            _log.error(f'Malformed definitions message from node {node!r} on {prefix}/{ARCHIVE_SEGMENT}/{node}/'
+                       f'{DEFINITIONS_TOPIC}: expected {{"node", "request_id", "definitions"}}, got '
+                       f'{str(message)[:200]!r}')
+            if request_id is not None:
+                self._publish_status(prefix, node, request_id, self._error_reply(
+                    'Malformed definitions message: expected {"node", "request_id", "definitions"}.'))
+            return
+        if message.get("node") != node:
+            _log.warning(f'Definitions message names node {message.get("node")!r} but arrived on the topic of '
+                         f'{node!r}; replying on {node!r}\'s status topic.')
+        if request_id is None:
+            _log.error(f'Definitions message from node {node!r} has no request_id; the node cannot match a reply. '
+                       f'The definitions are registered anyway.')
+        reply = self._register(message["definitions"])
+        if request_id is not None:
+            self._publish_status(prefix, node, request_id, reply)
+
+    def _publish_status(self, prefix, node, request_id, reply):
+        topic = f"{prefix}/{ARCHIVE_SEGMENT}/{node}/{STATUS_TOPIC}"
+        now = datetime.now(timezone.utc).isoformat()
+        message = {"request_id": request_id, "node": node, **reply}
+        try:
+            self.vip.pubsub.publish(peer="pubsub", topic=topic, headers={headers_mod.DATE: now,
+                                                                        headers_mod.TIMESTAMP: now},
+                                    message=message).get(timeout=10.0)
+        except Exception as exc:
+            _log.error(f"Could not publish the registration status for node {node!r} (request {request_id}) on "
+                       f"{topic!r}: {exc!r}. Outcome was: {reply['status']}: {reply['message']}")
 
     # ---------------------------------------------------------------- TENT archive registration
     @RPC.export
     def create_tables(self, definitions):
         """
         Register archive table definitions (the structure TENT's `get_archive_definitions` returns) and create the
-        tables. Definitions are checked against an allow-list of keys, column types and column keywords, persisted in
-        `known_table_definitions`, and compared with the stored definition when a table is registered again.
+        tables. Each definition is checked against an allow-list of keys, column types and column keywords, persisted
+        in `known_table_definitions`, and compared with the stored definition when its table is registered again
+        (column order does not matter). Tables are handled one by one: the unchanged ones are registered even when
+        another in the same call is rejected.
 
-        Returns {"status": "success", "registered_tables": [names new in this call], "known_tables": [all]} or
-        {"status": "error", "message": ..., "differences": {table: unified diff}} when a re-registration differs.
+        Returns {"status": "success" | "partial" | "error", "registered_tables": [accepted names],
+        "rejected_tables": {name: {"message": str, "differences": unified diff or None}}, "message": str}; "success"
+        means every table is registered (created now or already known and identical), "partial" that at least one
+        was and at least one was rejected, "error" that none was.
 
         This RPC runs DDL; the modular platform has no `RPC.allow` decorator, so protect it per deployment:
         `vctl authz add agent <historian identity> --protected-rpcs create_tables` and give each node
         `--rpc-capabilities <historian identity>.create_tables`.
         """
         if self.store is None or not self.store.ready:
-            return {"status": "error", "message": f"The historian database is not open. {CONFIGURATION_HELP}"}
+            return self._error_reply(f"The historian database is not open. {CONFIGURATION_HELP}")
+        return self._register(definitions)
+
+    def _register(self, definitions):
         try:
-            parsed = parse_definitions(definitions)
-            registered = self.store.register_definitions(parsed)
-        except TableDefinitionMismatch as exc:
-            _log.error(f"create_tables rejected: {exc}")
-            return {"status": "error", "message": str(exc), "differences": exc.differences}
-        except ValueError as exc:
-            _log.error(f"create_tables rejected: {exc}")
-            return {"status": "error", "message": str(exc)}
+            result = self.store.register_definitions(parse_definitions(definitions))
+        except ValueError as exc:  # unparsable request (not JSON, not a list or mapping)
+            _log.error(f"Table registration rejected: {exc}")
+            return self._error_reply(str(exc))
+        except Exception as exc:  # the database itself failed; nothing was registered
+            _log.exception("Table registration failed")
+            return self._error_reply(f"Registration failed: {exc!r}")
+        return self._registration_reply(result)
+
+    @staticmethod
+    def _registration_reply(result: RegistrationResult):
         return {
-            "status": "success",
-            "registered_tables": registered,
-            "known_tables": sorted(self.store.writable_tables),
+            "status": result.status,
+            "registered_tables": list(result.registered),
+            "rejected_tables": dict(result.rejected),
+            "message": result.message,
         }
+
+    @staticmethod
+    def _error_reply(message):
+        return {"status": "error", "registered_tables": [], "rejected_tables": {}, "message": message}
 
     # ---------------------------------------------------------------- standard query contract
     def query_topic_list(self):

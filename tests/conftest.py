@@ -73,6 +73,6 @@ def standard_record(topic="record/example", value=42.5, meta=None, timestamp=Non
     }
 
 
-def envelope_record(envelopes, topic="tns/campus/archive", record_id=1):
+def envelope_record(envelopes, topic="tns/archive/campus/records", record_id=1):
     """What the historian receives when a node's VolttronDataManager publishes a batch of envelopes."""
     return standard_record(topic=topic, value=envelopes, record_id=record_id)
