@@ -10,7 +10,7 @@ poetry = "*"
 [pypi-dependencies]
 volttron-core = { path = "../volttron-core", editable = true }
 tent = { path = "../TENT", editable = true }
-volttron-transactive-node-historian = { path = ".", editable = true }
+volttron-application-historian = { path = ".", editable = true }
 
 [tasks]
 # Build wheel

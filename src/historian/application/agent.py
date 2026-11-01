@@ -1,28 +1,31 @@
 #!/usr/bin/env python
 """
-A modular VOLTTRON historian backed by TENT's LocalDataManager.
+The Application Historian: a modular VOLTTRON historian that stores an application's archive records in a SQLAlchemy
+database through TENT's LocalDataManager, beside the platform's standard records.
 
 It serves two kinds of record through one BaseHistorian subscription set:
 
 - standard VOLTTRON records (`devices/`, `analysis/`, `datalogger/`, `record/`), stored in the standard `topics` and
   `data` tables and answered through the standard query RPCs (`query`, `get_topic_list`, `get_topics_by_pattern`,
   `get_topics_metadata`), so that the agent can be installed as the platform's historian;
-- TENT archive envelopes, `{"table_name": ..., "data": {...}}` or lists of them, which a TransactiveNodeAgent's
-  VolttronDataManager publishes on `<db_topic>/archive/<node>/records` after registering its table definitions,
-  either with the `create_tables` RPC (default) or by publishing them on `<db_topic>/archive/<node>/definitions`;
-  the historian answers the pubsub path on `<db_topic>/archive/<node>/status`. Envelopes are stored in the
-  registered archive tables. A registration states the node's archive schema version
-  (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`) beside its definitions and is refused when it is not the version this
-  historian's TENT writes; the database itself is refused at start-up when it was written with another version.
+- archive envelopes, `{"table_name": ..., "data": {...}}` or lists of them, which a publisher (any agent that archives
+  through this historian) publishes on `<prefix>/archive/<publisher>/records` after registering its table
+  definitions, either with the `create_tables` RPC (default) or by publishing them on
+  `<prefix>/archive/<publisher>/definitions`; the historian answers the pubsub path on
+  `<prefix>/archive/<publisher>/status`. Envelopes are stored in the registered archive tables. A registration
+  states the publisher's archive schema version (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`) beside its definitions
+  and is refused when it is not the version this historian's TENT writes; the database itself is refused at start-up
+  when it was written with another version.
 
-Topics under `<db_topic>/archive/` are routed by their last segment (records, definitions, status); every other
-captured topic is a standard record, except that an archive envelope is recognised by shape wherever it arrives. All
-database handling is in `HistorianStore` (store.py); this module is the VOLTTRON shell: configuration from the config
-store, RPC exports, the pubsub registration path and the BaseHistorian publishing contract.
+`<publisher>` is an opaque segment chosen by the publisher; the historian only echoes it in its status replies. Topics
+under `<prefix>/archive/` are routed by their last segment (records, definitions, status); every other captured topic
+is a standard record, except that an archive envelope is recognised by shape wherever it arrives. All database
+handling is in `HistorianStore` (store.py); this module is the VOLTTRON shell: configuration from the config store,
+RPC exports, the pubsub registration path and the BaseHistorian publishing contract.
 
 Identity: VOLTTRON historians are conventionally installed as `platform.historian` (`DEFAULT_VIP_IDENTITY`); the
-modular platform assigns the identity at `vctl install --vip-identity`, so a deployment may choose another (the TENT
-containers use `tns.historian`) as long as every node's `historian_vip` names the same one.
+modular platform assigns the identity at `vctl install --vip-identity`, so a deployment may choose another, as long as
+every publisher addresses the same one.
 
 Aggregation (`agg_type`/`agg_period` on `query`, `get_aggregate_topics`) is not supported by this historian: there are
 no aggregate tables, and an aggregate query raises rather than returning an empty result.
@@ -39,8 +42,8 @@ from volttron.client.messaging import headers as headers_mod
 from volttron.client.vip.agent import RPC
 from volttron.utils import load_config, vip_main
 
-from historian.transactivate_node.definitions import parse_definitions, parse_registration
-from historian.transactivate_node.store import HistorianStore, RegistrationResult
+from historian.application.definitions import parse_definitions, parse_registration
+from historian.application.store import HistorianStore, RegistrationResult
 
 __version__ = "3.0.0"
 
@@ -53,7 +56,7 @@ ARCHIVE_SEGMENT = "archive"
 RECORDS_TOPIC, DEFINITIONS_TOPIC, STATUS_TOPIC = "records", "definitions", "status"
 
 CONFIGURATION_HELP = ('Store the historian configuration as the config-store entry "config" of the historian\'s VIP '
-                      'identity, e.g. vctl config store <identity> config tns-historian.json. It must contain '
+                      'identity, e.g. vctl config store <identity> config <config file>. It must contain '
                       '{"connection": {"params": {"url": "<SQLAlchemy URL>"}}}.')
 
 
@@ -67,7 +70,7 @@ def historian(config_path, **kwargs):
     tables_def = config.pop("tables_def", None)
     table_definitions = config.pop("table_definitions", None)
     kwargs.update(config)
-    return TransactiveNodeHistorian(
+    return ApplicationHistorian(
         connection=connection,
         tables_def=tables_def,
         table_definitions=table_definitions,
@@ -75,14 +78,14 @@ def historian(config_path, **kwargs):
     )
 
 
-class TransactiveNodeHistorian(BaseHistorian):
-    """Store standard VOLTTRON records and registered TENT archive records in one SQLAlchemy database."""
+class ApplicationHistorian(BaseHistorian):
+    """Store standard VOLTTRON records and registered application archive records in one SQLAlchemy database."""
 
     def __init__(self, connection=None, tables_def=None, table_definitions=None, **kwargs):
         # The RPC handlers (create_tables, queries) run on the agent's greenlets; the publishing loop must as well so
         # that the data manager is never touched from a second OS thread.
         if not kwargs.pop("process_loop_in_greenlet", True):
-            raise ValueError("TransactiveNodeHistorian requires process_loop_in_greenlet=True (the default).")
+            raise ValueError("ApplicationHistorian requires process_loop_in_greenlet=True (the default).")
         if connection is not None:
             HistorianStore.validate_connection(connection)  # fail at install time, not when the first record arrives
         self.connection = connection
@@ -123,7 +126,7 @@ class TransactiveNodeHistorian(BaseHistorian):
 
     def publish_to_historian(self, to_publish_list):
         """
-        Persist one BaseHistorian batch. Topics under `<prefix>/archive/<node>/` are handled by kind: `records` carry
+        Persist one BaseHistorian batch. Topics under `<prefix>/archive/<publisher>/` are handled by kind: `records` carry
         envelopes, `definitions` carry a registration request (answered on `status`), `status` is the historian's own
         reply coming back through its capture and is ignored. Everything else is written as it comes. Every record is
         reported handled: rows that cannot be stored are logged, not retried.
@@ -137,7 +140,7 @@ class TransactiveNodeHistorian(BaseHistorian):
             if parsed is None:
                 to_write.append(record)
                 continue
-            prefix, node, kind = parsed
+            prefix, publisher, kind = parsed
             if kind == RECORDS_TOPIC:
                 if HistorianStore.is_envelope_payload(record.get("value")):
                     to_write.append(record)
@@ -145,7 +148,7 @@ class TransactiveNodeHistorian(BaseHistorian):
                     _log.error(f'Dropped a message on {record["topic"]!r} that is not an archive envelope or a list '
                                f'of them: {str(record.get("value"))[:200]!r}')
             elif kind == DEFINITIONS_TOPIC:
-                self._handle_definitions_message(prefix, node, record.get("value"))
+                self._handle_definitions_message(prefix, publisher, record.get("value"))
             else:  # STATUS_TOPIC: the historian's own publication
                 _log.debug(f'Ignoring the historian\'s own status publication on {record["topic"]!r}')
         if to_write:
@@ -157,7 +160,7 @@ class TransactiveNodeHistorian(BaseHistorian):
 
     @staticmethod
     def parse_archive_topic(topic):
-        """(prefix, node, kind) for `<prefix>/archive/<node>/<records|definitions|status>`, else None."""
+        """(prefix, publisher, kind) for `<prefix>/archive/<publisher>/<records|definitions|status>`, else None."""
         parts = topic.split("/")
         if (len(parts) < 4 or parts[-3] != ARCHIVE_SEGMENT or not parts[-2]
                 or parts[-1] not in (RECORDS_TOPIC, DEFINITIONS_TOPIC, STATUS_TOPIC)):
@@ -165,52 +168,55 @@ class TransactiveNodeHistorian(BaseHistorian):
         return "/".join(parts[:-3]), parts[-2], parts[-1]
 
     # ---------------------------------------------------------------- pubsub registration path
-    def _handle_definitions_message(self, prefix, node, message):
+    def _handle_definitions_message(self, prefix, publisher, message):
         """
-        Register the definitions in a `{"node", "request_id", "definitions", "schema_version"}` message and publish the
-        outcome on `<prefix>/archive/<node>/status`. A malformed message is logged; it gets an "error" status reply
-        only when it carries a request_id to answer.
+        Register the definitions in a `{"publisher", "request_id", "definitions", "schema_version"}` message and
+        publish the outcome on `<prefix>/archive/<publisher>/status`. A malformed message is logged; it gets an "error"
+        status reply only when it carries a request_id to answer.
         """
         request_id = message.get("request_id") if isinstance(message, Mapping) else None
         if not isinstance(request_id, str) or not request_id:
             request_id = None
         if not isinstance(message, Mapping) or "definitions" not in message:
-            _log.error(f'Malformed definitions message from node {node!r} on {prefix}/{ARCHIVE_SEGMENT}/{node}/'
-                       f'{DEFINITIONS_TOPIC}: expected {{"node", "request_id", "definitions"}}, got '
-                       f'{str(message)[:200]!r}')
+            _log.error(f'Malformed definitions message from publisher {publisher!r} on {prefix}/{ARCHIVE_SEGMENT}/'
+                       f'{publisher}/{DEFINITIONS_TOPIC}: expected {{"publisher", "request_id", "definitions", '
+                       f'"schema_version"}}, got {str(message)[:200]!r}')
             if request_id is not None:
-                self._publish_status(prefix, node, request_id, self._error_reply(
-                    'Malformed definitions message: expected {"node", "request_id", "definitions"}.'))
+                self._publish_status(prefix, publisher, request_id, self._error_reply(
+                    'Malformed definitions message: expected {"publisher", "request_id", "definitions", '
+                    '"schema_version"}.'))
             return
-        if message.get("node") != node:
-            _log.warning(f'Definitions message names node {message.get("node")!r} but arrived on the topic of '
-                         f'{node!r}; replying on {node!r}\'s status topic.')
+        named = message.get("publisher")
+        if named is not None and named != publisher:
+            _log.warning(f'Definitions message names publisher {named!r} but arrived on the topic of {publisher!r}; '
+                         f'replying on {publisher!r}\'s status topic.')
         if request_id is None:
-            _log.error(f'Definitions message from node {node!r} has no request_id; the node cannot match a reply. '
-                       f'The definitions are registered anyway.')
+            _log.error(f'Definitions message from publisher {publisher!r} has no request_id; the publisher cannot '
+                       f'match a reply. The definitions are registered anyway.')
         reply = self._register({"definitions": message["definitions"], "schema_version": message.get("schema_version")})
         if request_id is not None:
-            self._publish_status(prefix, node, request_id, reply)
+            self._publish_status(prefix, publisher, request_id, reply)
 
-    def _publish_status(self, prefix, node, request_id, reply):
-        topic = f"{prefix}/{ARCHIVE_SEGMENT}/{node}/{STATUS_TOPIC}"
+    def _publish_status(self, prefix, publisher, request_id, reply):
+        topic = f"{prefix}/{ARCHIVE_SEGMENT}/{publisher}/{STATUS_TOPIC}"
         now = datetime.now(timezone.utc).isoformat()
-        message = {"request_id": request_id, "node": node, **reply}
+        message = {"request_id": request_id, "publisher": publisher, **reply}
         try:
             self.vip.pubsub.publish(peer="pubsub", topic=topic, headers={headers_mod.DATE: now,
                                                                         headers_mod.TIMESTAMP: now},
                                     message=message).get(timeout=10.0)
         except Exception as exc:
-            _log.error(f"Could not publish the registration status for node {node!r} (request {request_id}) on "
-                       f"{topic!r}: {exc!r}. Outcome was: {reply['status']}: {reply['message']}")
+            _log.error(f"Could not publish the registration status for publisher {publisher!r} (request {request_id}) "
+                       f"on {topic!r}: {exc!r}. Outcome was: {reply['status']}: {reply['message']}")
 
+    # ---------------------------------------------------------------- archive table registration
     # ---------------------------------------------------------------- TENT archive registration
     @RPC.export
     def create_tables(self, definitions):
         """
         Register archive table definitions (the structure TENT's `get_archive_definitions` returns) and create the
-        tables. The argument is `{"definitions": [...], "schema_version": N}`: the node's definitions and its TENT's
-        `tent.data_manager.ARCHIVE_SCHEMA_VERSION`. A registration whose schema version is not the one this
+        tables. The argument is `{"definitions": [...], "schema_version": N}`: the publisher's definitions and its
+        TENT's `tent.data_manager.ARCHIVE_SCHEMA_VERSION`. A registration whose schema version is not the one this
         historian's TENT writes, or that states none (a TENT before 2 November 2026), is refused with "error" naming
         both versions and nothing is registered. Each definition is then checked against an allow-list of keys, column
         types and column keywords, persisted in `known_table_definitions`, and compared with the stored definition
@@ -224,7 +230,7 @@ class TransactiveNodeHistorian(BaseHistorian):
         that none was.
 
         This RPC runs DDL; the modular platform has no `RPC.allow` decorator, so protect it per deployment:
-        `vctl authz add agent <historian identity> --protected-rpcs create_tables` and give each node
+        `vctl authz add agent <historian identity> --protected-rpcs create_tables` and give each publisher
         `--rpc-capabilities <historian identity>.create_tables`.
         """
         if self.store is None or not self.store.ready:
@@ -237,7 +243,7 @@ class TransactiveNodeHistorian(BaseHistorian):
         except ValueError as exc:  # unparsable request (not JSON, not a list or mapping)
             _log.error(f"Table registration rejected: {exc}")
             return self._error_reply(str(exc))
-        problem = self.store.node_schema_version_problem(schema_version)
+        problem = self.store.publisher_schema_version_problem(schema_version)
         if problem is not None:
             _log.error(f"Table registration refused: {problem}")
             return self._error_reply(problem)
@@ -283,7 +289,7 @@ class TransactiveNodeHistorian(BaseHistorian):
                         skip=0, count=None, order="FIRST_TO_LAST"):
         """Raw values only; aggregation is not implemented and is refused rather than answered with nothing."""
         if agg_type or agg_period:
-            raise NotImplementedError("The transactive-node historian does not support aggregate queries "
+            raise NotImplementedError("The Application Historian does not support aggregate queries "
                                       "(agg_type/agg_period); query the raw topic instead.")
         topics = [topic] if isinstance(topic, str) else list(topic)
         return self.store.query(topics, start=start, end=end, skip=skip, count=count, order=order)

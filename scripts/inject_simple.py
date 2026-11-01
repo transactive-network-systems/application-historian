@@ -1,20 +1,20 @@
 #!/usr/bin/env python
 """
-Manual check against a running platform: register a table with the transactive-node historian and publish a few
+Manual check against a running platform: register a table with the Application Historian and publish a few
 archive envelopes and standard records. Not a pytest test (it needs VOLTTRON and a running historian).
 
 Before running:
 1. VOLTTRON is running with the historian installed and configured (see README.md). HISTORIAN_VIP below must be the
-   identity it was installed under (the containers use "tns.historian"; the agent's default is "platform.historian").
+   identity it was installed under (the agent's default is "platform.historian").
 2. Create credentials for this script's identity:  vctl auth add --identity test.injector
 3. If create_tables is protected (README, "Protecting create_tables"), give test.injector the capability
    <historian identity>.create_tables.
 
 Run with VOLTTRON_HOME set, e.g.:  pixi run python scripts/inject_simple.py
 
-Envelopes go on <ARCHIVE_PREFIX>/archive/<NODE>/records; ARCHIVE_PREFIX must match the historian's
-custom_topics.capture_record_data entry (case-sensitive; "tns/archive/" in this project's containers). Adjust the table name, columns and data below for your own schema; keep an "id"
-primary key column and do not include it in the data payload.
+Envelopes go on <ARCHIVE_PREFIX>/archive/<PUBLISHER>/records; ARCHIVE_PREFIX + "/archive/" must be the historian's
+custom_topics.capture_record_data entry (case-sensitive). Adjust the table name, columns and data below for your own
+schema; keep an "id" primary key column and do not include it in the data payload.
 """
 
 import json
@@ -45,13 +45,13 @@ def main():
     print(f"Connecting to: {vip_address}")
     
     # Create test data
-    test_table_name = "test_transactive_records"
-    HISTORIAN_VIP = "tns.historian"
-    ARCHIVE_PREFIX = "tns"
-    NODE = "test_injector"
+    test_table_name = "test_injected_records"
+    HISTORIAN_VIP = "platform.historian"
+    ARCHIVE_PREFIX = "app"
+    PUBLISHER = "test_injector"
     
     print("=" * 60)
-    print("TNS Historian Test Data Injection")
+    print("Application Historian Test Data Injection")
     print("=" * 60)
     print()
     
@@ -94,7 +94,7 @@ def main():
             print("Records will remain retryable until the table is registered.")
         
         # Publish test records
-        topic = f"{ARCHIVE_PREFIX}/archive/{NODE}/records"
+        topic = f"{ARCHIVE_PREFIX}/archive/{PUBLISHER}/records"
         print(f"\nPublishing test records to {topic}...")
         standard_topic = f"record/{test_table_name}"
         

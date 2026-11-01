@@ -1,7 +1,7 @@
 """
 Stand-ins for the VOLTTRON modules the historian agent imports, so the agent shell can be exercised without a platform.
 
-Only what `historian.transactivate_node.transactive_node` touches is provided. `BaseHistorian.parse_table_def` is a
+Only what `historian.application.agent` touches is provided. `BaseHistorian.parse_table_def` is a
 copy of the base historian's (volttron-lib-base-historian 2.0.0rc3) so table naming matches the real agent.
 """
 import sys

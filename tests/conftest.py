@@ -18,7 +18,7 @@ volttron_stubs.install()
 
 # A small TENT-shaped schema: joined inheritance (market -> component), a UUID identity key, an enumeration, a
 # timezone-aware datetime, an interval and a boolean, which together cover every branch of the normaliser.
-NODE_DEFINITIONS = [
+SAMPLE_DEFINITIONS = [
     {
         "name": "component",
         "columns": [
@@ -51,8 +51,8 @@ NODE_DEFINITIONS = [
 TABLE_NAMES = {"topics_table": "topics", "data_table": "data"}
 
 
-def registration(definitions=NODE_DEFINITIONS, schema_version=ARCHIVE_SCHEMA_VERSION):
-    """The create_tables argument a node sends: its definitions beside its TENT's archive schema version."""
+def registration(definitions=SAMPLE_DEFINITIONS, schema_version=ARCHIVE_SCHEMA_VERSION):
+    """The create_tables argument a publisher sends: its definitions beside its TENT's archive schema version."""
     return {"definitions": definitions, "schema_version": schema_version}
 
 
@@ -79,6 +79,6 @@ def standard_record(topic="record/example", value=42.5, meta=None, timestamp=Non
     }
 
 
-def envelope_record(envelopes, topic="tns/archive/campus/records", record_id=1):
-    """What the historian receives when a node's VolttronDataManager publishes a batch of envelopes."""
+def envelope_record(envelopes, topic="app/archive/campus/records", record_id=1):
+    """What the historian receives when a publisher publishes a batch of envelopes."""
     return standard_record(topic=topic, value=envelopes, record_id=record_id)

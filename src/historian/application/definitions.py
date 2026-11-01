@@ -59,10 +59,10 @@ def parse_definitions(definitions) -> list[dict]:
 
 def parse_registration(payload) -> tuple[list[dict], object]:
     """
-    Split a registration payload into (definitions, schema_version). A node sends
+    Split a registration payload into (definitions, schema_version). A publisher sends
     {"definitions": [...], "schema_version": N}, N being its TENT's tent.data_manager.ARCHIVE_SCHEMA_VERSION; the
     definitions themselves may take any form parse_definitions accepts. schema_version is None when the payload is a
-    bare list, a {name: definition} mapping or a wrapper without the key: a node whose TENT predates the version
+    bare list, a {name: definition} mapping or a wrapper without the key: a publisher whose TENT predates the version
     (2 November 2026, archive schema version 1). The caller decides what to do with it; this only reads the message.
     """
     if isinstance(payload, str):

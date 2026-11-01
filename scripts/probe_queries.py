@@ -1,13 +1,21 @@
-"""Call the TNS historian's standard query RPCs from inside its platform. Run as the platform user with the venv python:
-    python scripts/probe_queries.py tcp://<platform address>:22916
-It lists topics, queries a device Power topic, matches a pattern and reads metadata; used to verify a deployment."""
+"""Call the Application Historian's standard query RPCs from inside its platform, to verify a deployment. Run as the
+platform user with the venv python:
+    python scripts/probe_queries.py tcp://<platform address>:22916 <historian identity> <device topic glob>
+e.g. python scripts/probe_queries.py tcp://127.0.0.1:22916 platform.historian 'Campus/Building/*/Power'
+It lists topics, queries the first topic matching the glob, matches the glob and reads that topic's metadata."""
 import json, sys
 from volttron.client.commands.connection import ControlConnection
-cc = ControlConnection(sys.argv[1])
+
+address, identity, pattern = sys.argv[1:4]
+cc = ControlConnection(address)
 rpc = cc.server.vip.rpc
-topics = rpc.call('tns.historian', 'get_topic_list').get(timeout=20)
+topics = rpc.call(identity, 'get_topic_list').get(timeout=20)
 print('topics:', len(topics), 'first:', sorted(topics)[:2])
-device_topic = next(t for t in sorted(topics) if '/HP' in t and t.endswith('/Power'))
-print('query_historian:', json.dumps(rpc.call('tns.historian', 'query', topic=device_topic, count=3).get(timeout=20), default=str)[:400])
-print('by pattern:', rpc.call('tns.historian', 'get_topics_by_pattern', topic_pattern='Campus/SMALL_OFFICE_DR/*/Power').get(timeout=20))
-print('metadata:', json.dumps(rpc.call('tns.historian', 'get_topics_metadata', topics=[device_topic]).get(timeout=20), default=str)[:200])
+matched = rpc.call(identity, 'get_topics_by_pattern', topic_pattern=pattern).get(timeout=20)
+print('by pattern:', matched)
+if not matched:
+    sys.exit(f'no topic matches {pattern!r}')
+device_topic = sorted(matched)[0]
+print('query:', json.dumps(rpc.call(identity, 'query', topic=device_topic, count=3).get(timeout=20), default=str)[:400])
+print('metadata:', json.dumps(rpc.call(identity, 'get_topics_metadata', topics=[device_topic]).get(timeout=20),
+                              default=str)[:200])

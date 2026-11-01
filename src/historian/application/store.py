@@ -1,17 +1,17 @@
 """
-Database side of the transactive-node historian, kept free of VOLTTRON so it can be exercised against a SQLite file.
+Database side of the Application Historian, kept free of VOLTTRON so it can be exercised against a SQLite file.
 
 `HistorianStore` owns one TENT `LocalDataManager` (SQLAlchemy) and in it:
 
 - the standard historian tables (`topics`, `data`) for ordinary VOLTTRON records;
 - `known_table_definitions`: one row per registered archive table (name, canonical definition JSON, time registered).
-  Definitions arrive over the `create_tables` RPC from each node's VolttronDataManager; persisting them beside the data
-  is what lets the historian restart without the nodes re-registering, and is what the mismatch check compares against;
+  Definitions arrive from each publisher's registration (RPC or pubsub); persisting them beside the data is what lets
+  the historian restart without the publishers re-registering, and is what the mismatch check compares against;
 - `archive_schema`: TENT's one-row record of the archive schema version the database was written with
   (`tent.data_manager.ARCHIVE_SCHEMA_VERSION`), written by the data manager when the database is new and checked on
   every start-up: a database of another version is refused (`ArchiveSchemaMismatch`, both versions in the message),
-  nothing is migrated. A node's registration states its own schema version and is refused when it differs from the
-  historian's TENT (`node_schema_version_problem`);
+  nothing is migrated. A publisher's registration states its own schema version and is refused when it differs from the
+  historian's TENT (`publisher_schema_version_problem`);
 - the archive tables themselves, created from those definitions.
 
 On start-up (`setup`) the stored definitions are reloaded, any table in the database that has no stored definition is
@@ -33,7 +33,7 @@ from sqlalchemy.exc import ArgumentError
 from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
 from tent.data_manager.local_data_manager import LocalDataManager
 
-from historian.transactivate_node.definitions import (canonical_json, check_definitions, describe_difference,
+from historian.application.definitions import (canonical_json, check_definitions, describe_difference,
                                                       reject_unresolved)
 
 _log = logging.getLogger(__name__)
@@ -147,7 +147,7 @@ class HistorianStore:
     """The archive schema version this historian's TENT writes; the database is checked to be of it at set-up."""
 
     @staticmethod
-    def node_schema_version_problem(schema_version) -> str | None:
+    def publisher_schema_version_problem(schema_version) -> str | None:
         """
         None when a registration's declared archive schema version is this historian's; otherwise the reason it is
         refused, naming both versions. A registration that states no version comes from a TENT before 2 November 2026
@@ -159,8 +159,8 @@ class HistorianStore:
             described = 'does not state its archive schema version, so its TENT writes archive schema version 1'
         else:
             described = f'states archive schema version {schema_version!r}'
-        return (f'The node {described}; this historian\'s TENT writes archive schema version {ARCHIVE_SCHEMA_VERSION}. '
-                f'Nothing was registered. Run the node and the historian on TENT installations with the same archive '
+        return (f'The publisher {described}; this historian\'s TENT writes archive schema version {ARCHIVE_SCHEMA_VERSION}. '
+                f'Nothing was registered. Run the publisher and the historian on TENT installations with the same archive '
                 f'schema version.')
 
     @property

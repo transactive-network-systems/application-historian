@@ -11,7 +11,7 @@
     "capture_record_data": true,
     "custom_topics": {
         "capture_record_data": [
-            "tns/archive/"
+            "app/archive/"
         ]
     },
     "tables_def": {

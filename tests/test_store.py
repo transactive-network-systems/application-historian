@@ -7,8 +7,8 @@ import pytest
 from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 
-from conftest import NODE_DEFINITIONS, TABLE_NAMES, envelope_record, standard_record
-from historian.transactivate_node.store import KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
+from conftest import SAMPLE_DEFINITIONS, TABLE_NAMES, envelope_record, standard_record
+from historian.application.store import KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
 from tent.data_manager import ARCHIVE_SCHEMA_TABLE, ARCHIVE_SCHEMA_VERSION, ArchiveSchemaMismatch
 from tent.enumerations import MarketTypes
 
@@ -81,12 +81,12 @@ def test_new_database_records_the_archive_schema_version(connection, db_url):
     assert store.schema_version == ARCHIVE_SCHEMA_VERSION
     [row] = store.data_manager.query_data(ARCHIVE_SCHEMA_TABLE)
     assert row["version"] == ARCHIVE_SCHEMA_VERSION and row["fingerprint"] and row["tent_version"]
-    open_store(connection, NODE_DEFINITIONS)  # restart, same version: accepted, still one row
+    open_store(connection, SAMPLE_DEFINITIONS)  # restart, same version: accepted, still one row
     assert len(open_store(connection).data_manager.query_data(ARCHIVE_SCHEMA_TABLE)) == 1
 
 
 def test_database_of_another_schema_version_is_refused_at_setup(connection, db_url):
-    open_store(connection, NODE_DEFINITIONS)
+    open_store(connection, SAMPLE_DEFINITIONS)
     with create_engine(db_url).begin() as conn:
         conn.execute(text(f"UPDATE {ARCHIVE_SCHEMA_TABLE} SET version = {ARCHIVE_SCHEMA_VERSION + 5}"))
     with pytest.raises(ArchiveSchemaMismatch) as error:
@@ -99,7 +99,7 @@ def test_database_of_another_schema_version_is_refused_at_setup(connection, db_u
 
 def test_database_without_the_archive_schema_table_is_version_one_and_refused(connection, db_url):
     """A historian database from before 2 November 2026 has the historian's tables but no archive_schema."""
-    open_store(connection, NODE_DEFINITIONS)
+    open_store(connection, SAMPLE_DEFINITIONS)
     with create_engine(db_url).begin() as conn:
         conn.execute(text(f"DROP TABLE {ARCHIVE_SCHEMA_TABLE}"))
     with pytest.raises(ArchiveSchemaMismatch, match=f"version 1;.*version {ARCHIVE_SCHEMA_VERSION}"):
@@ -114,20 +114,20 @@ def test_archive_schema_is_a_reserved_table(connection):
     assert result.status == "error" and "reserved" in result.rejected[ARCHIVE_SCHEMA_TABLE]["message"]
 
 
-def test_node_schema_version_problem_names_both_versions():
-    assert HistorianStore.node_schema_version_problem(ARCHIVE_SCHEMA_VERSION) is None
-    problem = HistorianStore.node_schema_version_problem(ARCHIVE_SCHEMA_VERSION + 1)
+def test_publisher_schema_version_problem_names_both_versions():
+    assert HistorianStore.publisher_schema_version_problem(ARCHIVE_SCHEMA_VERSION) is None
+    problem = HistorianStore.publisher_schema_version_problem(ARCHIVE_SCHEMA_VERSION + 1)
     assert f"version {ARCHIVE_SCHEMA_VERSION + 1}" in problem and f"version {ARCHIVE_SCHEMA_VERSION}" in problem
     assert "Nothing was registered" in problem
-    missing = HistorianStore.node_schema_version_problem(None)
+    missing = HistorianStore.publisher_schema_version_problem(None)
     assert "does not state" in missing and "version 1" in missing and f"version {ARCHIVE_SCHEMA_VERSION}" in missing
-    assert HistorianStore.node_schema_version_problem(str(ARCHIVE_SCHEMA_VERSION)) is not None
-    assert HistorianStore.node_schema_version_problem(True) is not None
+    assert HistorianStore.publisher_schema_version_problem(str(ARCHIVE_SCHEMA_VERSION)) is not None
+    assert HistorianStore.publisher_schema_version_problem(True) is not None
 
 
 def test_register_persists_definitions_and_creates_tables(connection, db_url):
     store = open_store(connection)
-    result = store.register_definitions(NODE_DEFINITIONS)
+    result = store.register_definitions(SAMPLE_DEFINITIONS)
     assert result.status == "success"
     assert result.registered == ["component", "market", "time_interval"]
     assert result.created == ["component", "market", "time_interval"]
@@ -145,8 +145,8 @@ def test_register_persists_definitions_and_creates_tables(connection, db_url):
 
 def test_identical_re_registration_is_a_success_that_creates_nothing(connection):
     store = open_store(connection)
-    store.register_definitions(NODE_DEFINITIONS)
-    shuffled_keys = [dict(reversed(list(d.items()))) for d in NODE_DEFINITIONS]
+    store.register_definitions(SAMPLE_DEFINITIONS)
+    shuffled_keys = [dict(reversed(list(d.items()))) for d in SAMPLE_DEFINITIONS]
     result = store.register_definitions(shuffled_keys[::-1])  # order of tables and of keys does not matter
     assert result.status == "success"
     assert sorted(result.registered) == ["component", "market", "time_interval"]
@@ -156,8 +156,8 @@ def test_identical_re_registration_is_a_success_that_creates_nothing(connection)
 
 def test_reordered_columns_are_the_same_definition(connection):
     store = open_store(connection)
-    store.register_definitions(NODE_DEFINITIONS)
-    reordered = dict(NODE_DEFINITIONS[0], columns=list(reversed(NODE_DEFINITIONS[0]["columns"])))
+    store.register_definitions(SAMPLE_DEFINITIONS)
+    reordered = dict(SAMPLE_DEFINITIONS[0], columns=list(reversed(SAMPLE_DEFINITIONS[0]["columns"])))
     result = store.register_definitions([reordered])
     assert result.status == "success" and result.registered == ["component"] and result.created == []
 
@@ -175,10 +175,10 @@ def test_new_table_keeps_the_given_column_order(connection, db_url):
 
 def test_changed_re_registration_is_rejected_with_the_difference_and_the_rest_registered(connection):
     store = open_store(connection)
-    store.register_definitions(NODE_DEFINITIONS)
-    changed = dict(NODE_DEFINITIONS[2])
+    store.register_definitions(SAMPLE_DEFINITIONS)
+    changed = dict(SAMPLE_DEFINITIONS[2])
     changed["columns"] = changed["columns"][:-1] + [{"name": "duration", "type": "Float"}]
-    result = store.register_definitions([NODE_DEFINITIONS[0], changed])
+    result = store.register_definitions([SAMPLE_DEFINITIONS[0], changed])
     assert result.status == "partial"
     assert result.registered == ["component"]
     assert set(result.rejected) == {"time_interval"}
@@ -192,7 +192,7 @@ def test_changed_re_registration_is_rejected_with_the_difference_and_the_rest_re
 
 def test_invalid_definition_is_rejected_and_the_valid_ones_registered(connection):
     store = open_store(connection)
-    bad = dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
+    bad = dict(SAMPLE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
     other = {"name": "other", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}}]}
     result = store.register_definitions([bad, other])
     assert result.status == "partial"
@@ -204,8 +204,8 @@ def test_invalid_definition_is_rejected_and_the_valid_ones_registered(connection
 
 def test_tables_referring_to_a_rejected_table_are_rejected_with_it(connection):
     store = open_store(connection)
-    bad = dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
-    result = store.register_definitions([bad, NODE_DEFINITIONS[1], NODE_DEFINITIONS[2]])  # market inherits component,
+    bad = dict(SAMPLE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
+    result = store.register_definitions([bad, SAMPLE_DEFINITIONS[1], SAMPLE_DEFINITIONS[2]])  # market inherits component,
     assert result.status == "error"                                                     # time_interval -> market
     assert set(result.rejected) == {"component", "market", "time_interval"}
     assert "'component', which was rejected" in result.rejected["market"]["message"]
@@ -216,12 +216,12 @@ def test_tables_referring_to_a_rejected_table_are_rejected_with_it(connection):
 
 def test_foreign_key_to_an_unknown_table_is_rejected_not_created(connection, db_url):
     store = open_store(connection)
-    result = store.register_definitions([NODE_DEFINITIONS[2]])  # time_interval.market_id -> market, never registered
+    result = store.register_definitions([SAMPLE_DEFINITIONS[2]])  # time_interval.market_id -> market, never registered
     assert result.status == "error"
     assert "neither in this registration nor already registered" in result.rejected["time_interval"]["message"]
     assert "time_interval" not in inspect(create_engine(db_url)).get_table_names()
-    store.register_definitions(NODE_DEFINITIONS[:2])
-    assert store.register_definitions([NODE_DEFINITIONS[2]]).status == "success"  # target now registered
+    store.register_definitions(SAMPLE_DEFINITIONS[:2])
+    assert store.register_definitions([SAMPLE_DEFINITIONS[2]]).status == "success"  # target now registered
 
 
 def test_self_reference_and_reference_to_reflected_table_are_allowed(connection, db_url):
@@ -238,9 +238,9 @@ def test_self_reference_and_reference_to_reflected_table_are_allowed(connection,
 
 def test_unchanged_child_of_a_mismatched_but_existing_parent_is_registered(connection):
     store = open_store(connection)
-    store.register_definitions([NODE_DEFINITIONS[0]])
-    changed_parent = dict(NODE_DEFINITIONS[0], columns=NODE_DEFINITIONS[0]["columns"] + [{"name": "x", "type": "Text"}])
-    result = store.register_definitions([changed_parent, NODE_DEFINITIONS[1]])
+    store.register_definitions([SAMPLE_DEFINITIONS[0]])
+    changed_parent = dict(SAMPLE_DEFINITIONS[0], columns=SAMPLE_DEFINITIONS[0]["columns"] + [{"name": "x", "type": "Text"}])
+    result = store.register_definitions([changed_parent, SAMPLE_DEFINITIONS[1]])
     assert result.status == "partial"  # market is unchanged and its parent exists with the stored definition
     assert result.registered == ["market"] and set(result.rejected) == {"component"}
     assert store.registered_tables == {"component", "market"}
@@ -258,9 +258,9 @@ def test_registering_a_reserved_table_is_refused(connection):
 
 
 def test_configured_definitions_are_registered_at_setup(connection):
-    store = open_store(connection, NODE_DEFINITIONS)
+    store = open_store(connection, SAMPLE_DEFINITIONS)
     assert store.writable_tables == {"component", "market", "time_interval"}
-    bad = [dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType"}])]
+    bad = [dict(SAMPLE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType"}])]
     with pytest.raises(ValueError, match="PickleType"):
         open_store(connection, bad)
 
@@ -268,7 +268,7 @@ def test_configured_definitions_are_registered_at_setup(connection):
 # ---------------------------------------------------------------- restart
 def test_restart_reloads_definitions_and_accepts_envelopes_without_re_registration(connection, caplog):
     first = open_store(connection)
-    first.register_definitions(NODE_DEFINITIONS)
+    first.register_definitions(SAMPLE_DEFINITIONS)
     first.write([envelope_record(market_envelopes()[:1])])
 
     restarted = open_store(connection)  # no register_definitions call
@@ -281,9 +281,9 @@ def test_restart_reloads_definitions_and_accepts_envelopes_without_re_registrati
 
 
 def test_restart_with_a_changed_definition_is_still_refused(connection):
-    open_store(connection).register_definitions(NODE_DEFINITIONS)
+    open_store(connection).register_definitions(SAMPLE_DEFINITIONS)
     restarted = open_store(connection)
-    changed = dict(NODE_DEFINITIONS[0], columns=NODE_DEFINITIONS[0]["columns"] + [{"name": "extra", "type": "Text"}])
+    changed = dict(SAMPLE_DEFINITIONS[0], columns=SAMPLE_DEFINITIONS[0]["columns"] + [{"name": "extra", "type": "Text"}])
     result = restarted.register_definitions([changed])
     assert result.status == "error" and "component" in result.rejected
 
@@ -292,7 +292,7 @@ def test_table_without_definition_is_reflected_with_a_warning_and_accepts_rows(c
     metadata = MetaData()
     Table("legacy_notes", metadata, Column("id", Integer, primary_key=True), Column("note", String(50)))
     metadata.create_all(create_engine(db_url))
-    with caplog.at_level(logging.WARNING, logger="historian.transactivate_node.store"):
+    with caplog.at_level(logging.WARNING, logger="historian.application.store"):
         store = open_store(connection)
     assert "legacy_notes" in store.reflected_tables
     assert "legacy_notes" in store.writable_tables
@@ -318,7 +318,7 @@ def test_registering_a_reflected_table_replaces_reflection_with_the_definition(c
 
 # ---------------------------------------------------------------- envelope writes
 def test_envelopes_with_json_string_values_are_normalised_by_column_type(connection):
-    store = open_store(connection, NODE_DEFINITIONS)
+    store = open_store(connection, SAMPLE_DEFINITIONS)
     result = store.write([envelope_record(market_envelopes())])
     assert result.archive_rows == 2 and result.standard_rows == 0 and result.dropped == 0
 
@@ -337,19 +337,19 @@ def test_envelopes_with_json_string_values_are_normalised_by_column_type(connect
 
 
 def test_single_envelope_value_is_accepted(connection):
-    store = open_store(connection, NODE_DEFINITIONS)
+    store = open_store(connection, SAMPLE_DEFINITIONS)
     result = store.write([envelope_record(market_envelopes()[0])])
     assert result.archive_rows == 1
     assert len(store.data_manager.query_data("market")) == 1
 
 
 def test_unknown_table_envelopes_are_dropped_and_counted_not_raised(connection, caplog):
-    store = open_store(connection, NODE_DEFINITIONS)
+    store = open_store(connection, SAMPLE_DEFINITIONS)
     records = [
         envelope_record([{"table_name": "never_registered", "data": {"id": 1}}] + market_envelopes()[:1], record_id=1),
         standard_record(topic="record/example", value=1.5, record_id=2),
     ]
-    with caplog.at_level(logging.ERROR, logger="historian.transactivate_node.store"):
+    with caplog.at_level(logging.ERROR, logger="historian.application.store"):
         result = store.write(records)
     assert result.skipped_unknown_table == {"never_registered": 1}
     assert result.archive_rows == 1 and result.standard_rows == 1
@@ -358,7 +358,7 @@ def test_unknown_table_envelopes_are_dropped_and_counted_not_raised(connection, 
 
 
 def test_row_the_data_manager_quarantines_does_not_block_the_rest_of_the_batch(connection, caplog):
-    store = open_store(connection, NODE_DEFINITIONS)
+    store = open_store(connection, SAMPLE_DEFINITIONS)
     good, bad = market_envelopes()
     bad = {"table_name": "time_interval", "data": dict(bad["data"], start_time="2026-06-09T13:00:00")}  # naive
     with caplog.at_level(logging.ERROR):
@@ -370,7 +370,7 @@ def test_row_the_data_manager_quarantines_does_not_block_the_rest_of_the_batch(c
 
 
 def test_database_failure_propagates_and_leaves_no_duplicate_queue(connection, monkeypatch):
-    store = open_store(connection, NODE_DEFINITIONS)
+    store = open_store(connection, SAMPLE_DEFINITIONS)
 
     def failing_archive(records):
         store.data_manager.archival_queue.extend(records)  # what LocalDataManager does before raising

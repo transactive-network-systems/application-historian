@@ -4,8 +4,8 @@ import json
 import pytest
 from tent.data_manager.reader import known_archive_definitions
 
-from conftest import NODE_DEFINITIONS
-from historian.transactivate_node.definitions import (canonical_form, canonical_json, check_definitions,
+from conftest import SAMPLE_DEFINITIONS
+from historian.application.definitions import (canonical_form, canonical_json, check_definitions,
                                                       describe_difference, parse_definitions)
 
 RESERVED = {"topics", "data", "known_table_definitions"}
@@ -26,11 +26,11 @@ def validate(definitions, known=frozenset()):
 class TestParseDefinitions:
 
     def test_list_json_string_mapping_and_wrapper_forms(self):
-        assert parse_definitions(NODE_DEFINITIONS) == NODE_DEFINITIONS
-        assert parse_definitions(json.dumps(NODE_DEFINITIONS)) == NODE_DEFINITIONS
-        assert parse_definitions({d["name"]: d for d in NODE_DEFINITIONS}) == NODE_DEFINITIONS
-        assert parse_definitions({"definitions": NODE_DEFINITIONS}) == NODE_DEFINITIONS
-        assert parse_definitions({"definitions": json.dumps(NODE_DEFINITIONS)}) == NODE_DEFINITIONS
+        assert parse_definitions(SAMPLE_DEFINITIONS) == SAMPLE_DEFINITIONS
+        assert parse_definitions(json.dumps(SAMPLE_DEFINITIONS)) == SAMPLE_DEFINITIONS
+        assert parse_definitions({d["name"]: d for d in SAMPLE_DEFINITIONS}) == SAMPLE_DEFINITIONS
+        assert parse_definitions({"definitions": SAMPLE_DEFINITIONS}) == SAMPLE_DEFINITIONS
+        assert parse_definitions({"definitions": json.dumps(SAMPLE_DEFINITIONS)}) == SAMPLE_DEFINITIONS
         assert parse_definitions(None) == []
 
     @pytest.mark.parametrize("bad", [42, "not json", b"bytes"])
@@ -45,7 +45,7 @@ class TestValidateDefinitions:
         validate(known_archive_definitions())
 
     def test_test_schema_is_accepted(self):
-        validate(NODE_DEFINITIONS)
+        validate(SAMPLE_DEFINITIONS)
 
     def test_empty_registration_accepts_nothing(self):
         assert check([]) == ([], {})
@@ -160,7 +160,7 @@ class TestValidateDefinitions:
 class TestComparison:
 
     def test_canonical_form_ignores_key_and_column_order(self):
-        definition = NODE_DEFINITIONS[1]
+        definition = SAMPLE_DEFINITIONS[1]
         reordered_keys = {key: definition[key] for key in reversed(list(definition))}
         assert canonical_json(reordered_keys) == canonical_json(definition)
         reordered_columns = dict(definition, columns=list(reversed(definition["columns"])))
@@ -170,7 +170,7 @@ class TestComparison:
         assert definition["columns"][0]["name"] == "id"  # the given definition is not modified
 
     def test_canonical_form_sees_a_changed_column(self):
-        definition = NODE_DEFINITIONS[2]
+        definition = SAMPLE_DEFINITIONS[2]
         changed = dict(definition, columns=definition["columns"][:-1] + [{"name": "duration", "type": "Float"}])
         assert canonical_json(changed) != canonical_json(definition)
         renamed = dict(definition, columns=definition["columns"][:-1] + [{"name": "length", "type": "Interval"}])

@@ -3,15 +3,15 @@ requires = ["poetry-core>=1.2.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-name = "volttron-transactive-node-historian"
+name = "volttron-application-historian"
 version = "3.0.0"
-description = "A modular VOLTTRON historian backed by TENT LocalDataManager"
+description = "The Application Historian: a modular VOLTTRON historian storing application archive records through TENT's LocalDataManager"
 authors = ["VOLTTRON Team <volttron@pnnl.gov>"]
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/eclipse-volttron/volttron-transactive-node-historian"
 homepage = "https://github.com/eclipse-volttron/volttron-transactive-node-historian"
-keywords = ["volttron", "agent", "historian", "transactive", "TNS", "data-storage"]
+keywords = ["volttron", "agent", "historian", "archive", "data-storage"]
 packages = [
     { include = "historian", from = "src" }
 ]
@@ -37,7 +37,7 @@ volttron-lib-base-historian = { version = ">=2.0.0rc1", allow-prereleases = true
 pytest = ">=7.0.0"
 
 [tool.poetry.scripts]
-volttron-transactive-node-historian = "historian.transactivate_node.transactive_node:main"
+volttron-application-historian = "historian.application.agent:main"
 
 [tool.isort]
 profile = "black"
