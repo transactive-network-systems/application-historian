@@ -1,0 +1,328 @@
+"""HistorianStore against a SQLite file: configuration, registration, restart, envelope and standard-record writes, queries."""
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, inspect, text
+from sqlalchemy.exc import OperationalError
+
+from conftest import NODE_DEFINITIONS, TABLE_NAMES, envelope_record, standard_record
+from historian.transactivate_node.definitions import TableDefinitionMismatch
+from historian.transactivate_node.store import KNOWN_TABLE_DEFINITIONS, HistorianStore, format_timestamp
+from tent.enumerations import MarketTypes
+
+MARKET_ID = "0190a3c0-0000-7000-8000-000000000001"
+INTERVAL_ID = "0190a3c0-0000-7000-8000-000000000002"
+
+
+def open_store(connection, definitions=()):
+    store = HistorianStore(connection, TABLE_NAMES)
+    store.setup(definitions)
+    return store
+
+
+def market_envelopes():
+    return [
+        {"table_name": "market", "data": {"id": MARKET_ID, "name": "day-ahead", "market_type": "auction",
+                                          "delivery_start_time": "2026-06-09T13:00:00+00:00", "active": True}},
+        {"table_name": "time_interval", "data": {"id": INTERVAL_ID, "market_id": MARKET_ID,
+                                                 "start_time": "2026-06-09T13:00:00Z", "duration": 3600.0}},
+    ]
+
+
+# ---------------------------------------------------------------- connection block
+class TestValidateConnection:
+
+    def test_bare_path_is_rejected_with_the_sqlite_url_form(self):
+        with pytest.raises(ValueError) as error:
+            HistorianStore.validate_connection({"params": {"url": "/home/vuzer/db/historian.sqlite"}})
+        message = str(error.value)
+        assert "not a SQLAlchemy URL" in message
+        assert "sqlite:////home/vuzer/db/historian.sqlite" in message
+
+    def test_relative_name_without_scheme_is_rejected(self):
+        with pytest.raises(ValueError, match="not a SQLAlchemy URL"):
+            HistorianStore.validate_connection({"params": {"url": "historian.sqlite"}})
+
+    @pytest.mark.parametrize("connection", [
+        None,
+        {"type": "sqlite", "params": {"url": "sqlite:///x.sqlite"}},  # the SQL historians' `type` key
+        {"params": {"database": "/home/vuzer/db/historian.sqlite"}},  # the SQL historians' `database` key
+        {"params": {}},
+        {},
+    ])
+    def test_other_shapes_are_rejected(self, connection):
+        with pytest.raises(ValueError, match="connection"):
+            HistorianStore.validate_connection(connection)
+
+    def test_sqlalchemy_urls_are_accepted(self):
+        assert HistorianStore.validate_connection({"params": {"url": "sqlite:////home/vuzer/db/h.sqlite"}}) \
+            == "sqlite:////home/vuzer/db/h.sqlite"
+        assert HistorianStore.validate_connection({"params": {"url": "postgresql://u:p@host/db"}}) \
+            == "postgresql://u:p@host/db"
+
+    def test_redacted_url_hides_the_password(self):
+        store = HistorianStore({"params": {"url": "postgresql://user:secret@host/db"}}, TABLE_NAMES)
+        assert "secret" not in store.redacted_url
+        assert "user" in store.redacted_url
+
+
+# ---------------------------------------------------------------- set-up and registration
+def test_setup_creates_the_historians_own_tables(connection, db_url):
+    open_store(connection)
+    present = set(inspect(create_engine(db_url)).get_table_names())
+    assert {"topics", "data", KNOWN_TABLE_DEFINITIONS} <= present
+
+
+def test_register_persists_definitions_and_creates_tables(connection, db_url):
+    store = open_store(connection)
+    registered = store.register_definitions(NODE_DEFINITIONS)
+    assert registered == ["component", "market", "time_interval"]
+    assert store.writable_tables == {"component", "market", "time_interval"}
+    present = set(inspect(create_engine(db_url)).get_table_names())
+    assert {"component", "market", "time_interval"} <= present
+    with create_engine(db_url).connect() as conn:
+        rows = conn.execute(text(f"SELECT name, definition, registered_time FROM {KNOWN_TABLE_DEFINITIONS}")).all()
+    assert {row[0] for row in rows} == {"component", "market", "time_interval"}
+    assert all('"columns"' in row[1] for row in rows)
+    assert all(row[2] for row in rows)
+
+
+def test_identical_re_registration_registers_nothing_and_is_not_an_error(connection):
+    store = open_store(connection)
+    store.register_definitions(NODE_DEFINITIONS)
+    shuffled_keys = [dict(reversed(list(d.items()))) for d in NODE_DEFINITIONS]
+    assert store.register_definitions(shuffled_keys[::-1]) == []  # order of tables and of keys does not matter
+    assert store.register_definitions([NODE_DEFINITIONS[0]]) == []
+
+
+def test_reordered_columns_are_a_different_definition(connection):
+    store = open_store(connection)
+    store.register_definitions(NODE_DEFINITIONS)
+    reordered = dict(NODE_DEFINITIONS[0], columns=list(reversed(NODE_DEFINITIONS[0]["columns"])))
+    with pytest.raises(TableDefinitionMismatch):
+        store.register_definitions([reordered])
+
+
+def test_changed_re_registration_is_refused_with_the_difference(connection):
+    store = open_store(connection)
+    store.register_definitions(NODE_DEFINITIONS)
+    changed = dict(NODE_DEFINITIONS[2])
+    changed["columns"] = changed["columns"][:-1] + [{"name": "duration", "type": "Float"}]
+    with pytest.raises(TableDefinitionMismatch) as error:
+        store.register_definitions([NODE_DEFINITIONS[0], changed])
+    assert set(error.value.differences) == {"time_interval"}
+    diff = error.value.differences["time_interval"]
+    assert '-   "type": "Interval"' in diff and '+   "type": "Float"' in diff
+    assert "time_interval" in str(error.value)
+    # nothing changed
+    assert store.writable_tables == {"component", "market", "time_interval"}
+
+
+def test_invalid_definition_is_refused_before_anything_is_stored(connection):
+    store = open_store(connection)
+    bad = dict(NODE_DEFINITIONS[0], columns=[{"name": "id", "type": "PickleType", "kwargs": {"primary_key": True}}])
+    with pytest.raises(ValueError, match="PickleType"):
+        store.register_definitions([bad, NODE_DEFINITIONS[1]])
+    assert store.registered_tables == set()
+
+
+def test_registering_a_reserved_table_is_refused(connection):
+    store = open_store(connection)
+    with pytest.raises(ValueError, match="reserved"):
+        store.register_definitions([{"name": "topics", "columns": [{"name": "x", "type": "Integer"}]}])
+
+
+def test_configured_definitions_are_registered_at_setup(connection):
+    store = open_store(connection, NODE_DEFINITIONS)
+    assert store.writable_tables == {"component", "market", "time_interval"}
+
+
+# ---------------------------------------------------------------- restart
+def test_restart_reloads_definitions_and_accepts_envelopes_without_re_registration(connection, caplog):
+    first = open_store(connection)
+    first.register_definitions(NODE_DEFINITIONS)
+    first.write([envelope_record(market_envelopes()[:1])])
+
+    restarted = open_store(connection)  # no register_definitions call
+    assert restarted.registered_tables == {"component", "market", "time_interval"}
+    assert restarted.reflected_tables == set()
+    result = restarted.write([envelope_record(market_envelopes()[1:])])
+    assert result.archive_rows == 1 and result.dropped == 0
+    rows = restarted.data_manager.query_data("time_interval")
+    assert rows[0]["duration"] == timedelta(hours=1)  # the Interval column semantics survived the restart
+
+
+def test_restart_with_a_changed_definition_is_still_refused(connection):
+    open_store(connection).register_definitions(NODE_DEFINITIONS)
+    restarted = open_store(connection)
+    changed = dict(NODE_DEFINITIONS[0], columns=NODE_DEFINITIONS[0]["columns"] + [{"name": "extra", "type": "Text"}])
+    with pytest.raises(TableDefinitionMismatch):
+        restarted.register_definitions([changed])
+
+
+def test_table_without_definition_is_reflected_with_a_warning_and_accepts_rows(connection, db_url, caplog):
+    metadata = MetaData()
+    Table("legacy_notes", metadata, Column("id", Integer, primary_key=True), Column("note", String(50)))
+    metadata.create_all(create_engine(db_url))
+    with caplog.at_level(logging.WARNING, logger="historian.transactivate_node.store"):
+        store = open_store(connection)
+    assert "legacy_notes" in store.reflected_tables
+    assert "legacy_notes" in store.writable_tables
+    assert "legacy_notes" not in store.registered_tables
+    assert any("legacy_notes" in r.message and "without a registered definition" in r.message for r in caplog.records)
+    result = store.write([envelope_record([{"table_name": "legacy_notes", "data": {"id": 1, "note": "kept"}}])])
+    assert result.archive_rows == 1
+    assert store.data_manager.query_data("legacy_notes") == [{"id": 1, "note": "kept"}]
+
+
+def test_registering_a_reflected_table_replaces_reflection_with_the_definition(connection, db_url):
+    metadata = MetaData()
+    Table("legacy_notes", metadata, Column("id", Integer, primary_key=True), Column("note", String(50)))
+    metadata.create_all(create_engine(db_url))
+    store = open_store(connection)
+    definition = {"name": "legacy_notes", "columns": [{"name": "id", "type": "Integer", "kwargs": {"primary_key": True}},
+                                                      {"name": "note", "type": "String", "type_args": [50]}]}
+    assert store.register_definitions([definition]) == ["legacy_notes"]
+    assert "legacy_notes" in store.registered_tables
+    assert "legacy_notes" not in store.reflected_tables
+    assert store.register_definitions([definition]) == []
+
+
+# ---------------------------------------------------------------- envelope writes
+def test_envelopes_with_json_string_values_are_normalised_by_column_type(connection):
+    store = open_store(connection, NODE_DEFINITIONS)
+    result = store.write([envelope_record(market_envelopes())])
+    assert result.archive_rows == 2 and result.standard_rows == 0 and result.dropped == 0
+
+    market = store.data_manager.query_data("market")[0]
+    assert market["id"] == uuid.UUID(MARKET_ID)
+    assert market["market_type"] is MarketTypes.auction
+    assert market["delivery_start_time"] == datetime(2026, 6, 9, 13, tzinfo=timezone.utc)
+    assert market["active"] is True
+    component = store.data_manager.query_data("component")[0]  # joined inheritance wrote the parent row
+    assert component["id"] == uuid.UUID(MARKET_ID) and component["name"] == "day-ahead"
+    interval = store.data_manager.query_data("time_interval")[0]
+    assert interval["id"] == uuid.UUID(INTERVAL_ID)
+    assert interval["market_id"] == uuid.UUID(MARKET_ID)
+    assert interval["start_time"] == datetime(2026, 6, 9, 13, tzinfo=timezone.utc)
+    assert interval["duration"] == timedelta(seconds=3600)
+
+
+def test_single_envelope_value_is_accepted(connection):
+    store = open_store(connection, NODE_DEFINITIONS)
+    result = store.write([envelope_record(market_envelopes()[0])])
+    assert result.archive_rows == 1
+    assert len(store.data_manager.query_data("market")) == 1
+
+
+def test_unknown_table_envelopes_are_dropped_and_counted_not_raised(connection, caplog):
+    store = open_store(connection, NODE_DEFINITIONS)
+    records = [
+        envelope_record([{"table_name": "never_registered", "data": {"id": 1}}] + market_envelopes()[:1], record_id=1),
+        standard_record(topic="record/example", value=1.5, record_id=2),
+    ]
+    with caplog.at_level(logging.ERROR, logger="historian.transactivate_node.store"):
+        result = store.write(records)
+    assert result.skipped_unknown_table == {"never_registered": 1}
+    assert result.archive_rows == 1 and result.standard_rows == 1
+    assert any("never_registered" in r.message for r in caplog.records)
+    assert store.topic_list() == ["record/example"]
+
+
+def test_row_the_data_manager_quarantines_does_not_block_the_rest_of_the_batch(connection, caplog):
+    store = open_store(connection, NODE_DEFINITIONS)
+    good, bad = market_envelopes()
+    bad = {"table_name": "time_interval", "data": dict(bad["data"], start_time="2026-06-09T13:00:00")}  # naive
+    with caplog.at_level(logging.ERROR):
+        result = store.write([envelope_record([bad, good])])
+    assert result.archive_rows == 2 and result.dropped == 0  # both handed over; TENT quarantined one of them
+    assert len(store.data_manager.query_data("market")) == 1
+    assert store.data_manager.query_data("time_interval") == []
+    assert any("Quarantined" in r.message and "timezone-aware" in r.message for r in caplog.records)
+
+
+def test_database_failure_propagates_and_leaves_no_duplicate_queue(connection, monkeypatch):
+    store = open_store(connection, NODE_DEFINITIONS)
+
+    def failing_archive(records):
+        store.data_manager.archival_queue.extend(records)  # what LocalDataManager does before raising
+        raise OperationalError("INSERT", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(store.data_manager, "archive_data", failing_archive)
+    with pytest.raises(OperationalError):
+        store.write([envelope_record(market_envelopes())])
+    assert len(store.data_manager.archival_queue) == 0
+
+
+def test_write_before_setup_raises(connection):
+    store = HistorianStore(connection, TABLE_NAMES)
+    with pytest.raises(RuntimeError, match="setup"):
+        store.write([standard_record()])
+
+
+# ---------------------------------------------------------------- standard records and queries
+def test_device_record_is_stored_and_queryable(connection):
+    store = open_store(connection)
+    topic = "devices/campus/building1/hvac/ZoneTemperature"
+    ts = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
+    store.write([standard_record(topic=topic, value=71.5, meta={"units": "F", "type": "float"}, timestamp=ts,
+                                 source="scrape")])
+
+    assert store.topic_list() == [topic]
+    assert store.topics_by_pattern("devices/campus/*/zonetemperature") == {topic: 1}
+    assert store.topics_metadata([topic]) == {topic: {"units": "F", "type": "float"}}
+    result = store.query([topic])
+    assert result == {"values": [("2026-06-09T12:00:00.000000+00:00", 71.5)],
+                      "metadata": {"units": "F", "type": "float"}}
+    assert store.query([topic.upper()])["values"] == result["values"]  # topic lookup is case-insensitive
+
+
+def test_query_window_order_count_skip_and_multiple_topics(connection):
+    store = open_store(connection)
+    base = datetime(2026, 6, 9, 0, 0, tzinfo=timezone.utc)
+    records = [standard_record(topic="devices/a/power", value=i, timestamp=base + timedelta(hours=i), record_id=i)
+               for i in range(5)]
+    records.append(standard_record(topic="devices/b/power", value=99, timestamp=base, record_id=10))
+    store.write(records)
+
+    window = store.query(["devices/a/power"], start=base + timedelta(hours=1), end=base + timedelta(hours=3))
+    assert [v for _, v in window["values"]] == [1, 2]  # start inclusive, end exclusive
+    latest = store.query(["devices/a/power"], order="LAST_TO_FIRST", count=2)
+    assert [v for _, v in latest["values"]] == [4, 3]
+    skipped = store.query(["devices/a/power"], skip=3)
+    assert [v for _, v in skipped["values"]] == [3, 4]
+    multi = store.query(["devices/a/power", "devices/b/power", "devices/none"])
+    assert set(multi["values"]) == {"devices/a/power", "devices/b/power"}
+    assert multi["metadata"] == {}
+    assert store.query(["devices/none"]) == {}
+    assert store.query(["devices/a/power"], start=base + timedelta(days=1)) == {}
+
+
+def test_standard_record_updates_metadata_and_keeps_one_row_per_timestamp(connection):
+    store = open_store(connection)
+    ts = datetime(2026, 6, 9, 12, 0, tzinfo=timezone.utc)
+    store.write([standard_record(topic="record/x", value=1, meta={"units": "kW"}, timestamp=ts)])
+    store.write([standard_record(topic="record/x", value=2, meta={"units": "MW"}, timestamp=ts)])
+    result = store.query(["record/x"])
+    assert result["values"] == [("2026-06-09T12:00:00.000000+00:00", 2)]
+    assert result["metadata"] == {"units": "MW"}
+    restarted = open_store(connection)
+    assert restarted.topics_metadata(["record/x"]) == {"record/x": {"units": "MW"}}
+
+
+def test_topic_pattern_is_a_glob_not_a_regex(connection):
+    store = open_store(connection)
+    store.write([standard_record(topic="devices/a/power(1)", record_id=1),
+                 standard_record(topic="devices/a/power1", record_id=2)])
+    assert store.topics_by_pattern("devices/a/power(1)") == {"devices/a/power(1)": 1}
+    assert store.topics_by_pattern("devices/*/power?") == {"devices/a/power1": 2}
+    assert store.topics_by_pattern("(a+)+$") == {}  # regex syntax is literal text here and matches nothing
+
+
+def test_format_timestamp_matches_the_base_historian_form():
+    assert format_timestamp(datetime(2026, 6, 9, 12, 0, 0, 5, tzinfo=timezone.utc)) == "2026-06-09T12:00:00.000005+00:00"
+    assert format_timestamp(datetime(2026, 6, 9, 12, 0)) == "2026-06-09T12:00:00.000000"
+    eastern = timezone(timedelta(hours=-5))
+    assert format_timestamp(datetime(2026, 6, 9, 7, 0, tzinfo=eastern)) == "2026-06-09T07:00:00.000000-05:00"
